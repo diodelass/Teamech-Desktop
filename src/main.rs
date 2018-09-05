@@ -1,5 +1,11 @@
 /* Teamech Desktop Client v0.2
- * August 2018
+ * September 2018
+ * License: GPL v3.0
+ *
+ * This source code is provided with ABSOLUTELY NO WARRANTY. You are fully responsible for any
+ * operations that your computers carry out as a result of running this code or anything derived
+ * from it. The developer assumes the full absolution of liability described in the GPL v3.0
+ * license.
  * 
  * OVERVIEW
  * Teamech is a simple, low-bandwidth supervisory control and data relay system intended for
@@ -36,7 +42,7 @@
  * scary to you, take note that this is intended as a local-area mini-SCADA system, not an
  * international encrypted messenger for human-to-human messages.) Teacrypt pads (key files) consist 
  * of large (usually at least 10 MB) files of variable size, which are symmetric between clients and
-  * servers. Each message is encrypted with a unique key generated from the pad file and signed with
+ * servers. Each message is encrypted with a unique key generated from the pad file and signed with
  * a unique shared secret. Upon receiving a message, the server decrypts it, logs its contents, and
  * verifies its message signature. If the signature validates, then the original encrypted payload
  * is forwarded to all other subscribers. Any subscriber that sends a message whose signature fails
@@ -140,6 +146,7 @@ fn bytes2hex(v:&Vec<u8>) -> String {
 	return result;
 }
 
+// Teacrypt implementation: Generate single-use key and secret seed.
 // Generates a single-use encryption key from a provided key size, pad file and authentication 
 // nonce, and returns the key and its associated secret seed.
 fn keygen(nonce:&[u8;8],padpath:&Path,keysize:&usize) -> Result<(Vec<u8>,Vec<u8>),io::Error> {
@@ -198,6 +205,7 @@ fn keygen(nonce:&[u8;8],padpath:&Path,keysize:&usize) -> Result<(Vec<u8>,Vec<u8>
 	return Ok((keybytes,seed.to_vec()));
 }
 
+// Teacrypt implementation: Encrypt a message for transmission.
 // Depends on keygen function; generates a random nonce, produces a key, signs the message using
 // the secret seed, and returns the resulting encrypted payload (including the message,
 // signature, and nonce).
@@ -230,6 +238,7 @@ fn encrypt(message:&Vec<u8>,padpath:&Path) -> Result<Vec<u8>,io::Error> {
 	return Ok(payload);
 }
 
+// Teacrypt implementation: Decrypt a received message.
 // Depends on keygen function; uses the nonce attached to the payload to generate the same key and
 // secret seed, decrypt the payload, and verify the resulting message with its signature. The
 // signature will only validate if the message was the original one encrypted with the same pad 

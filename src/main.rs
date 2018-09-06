@@ -291,11 +291,11 @@ fn decrypt(payload:&Vec<u8>,padpath:&Path) -> Result<Vec<u8>,io::Error> {
 
 // Sends a vector of bytes to a specific host over a specific socket, automatically retrying in the event of certain errors
 // and aborting in the event of others.
-fn sendbytes(listener:&UdpSocket,destaddr:&SocketAddr,bytes:&Vec<u8>) -> Result<(),io::Error> {
+fn sendraw(listener:&UdpSocket,destaddr:&SocketAddr,payload:&Vec<u8>) -> Result<(),io::Error> {
 	// loop until either the send completes or an unignorable error occurs.
 	loop {
-		match listener.send_to(&bytes[..],destaddr) {
-			Ok(nsend) => match nsend < bytes.len() {
+		match listener.send_to(&payload[..],destaddr) {
+			Ok(nsend) => match nsend < payload.len() {
 				// If the message sends in its entirety, exit with success. If it sends
 				// incompletely, try again.
 				false => return Ok(()),
@@ -306,7 +306,6 @@ fn sendbytes(listener:&UdpSocket,destaddr:&SocketAddr,bytes:&Vec<u8>) -> Result<
 				// WouldBlock for a send operation usually means that the transmit buffer is full.
 				io::ErrorKind::Interrupted => (),
 				io::ErrorKind::WouldBlock => {
-					// Transmit buffer overflow!
 					return Err(why);
 				},
 				_ => {
@@ -315,6 +314,19 @@ fn sendbytes(listener:&UdpSocket,destaddr:&SocketAddr,bytes:&Vec<u8>) -> Result<
 			},
 		};
 	}
+}
+
+// Automatically encrypts a vector of bytes and sends them over the socket.
+fn sendbytes(listener:&UdpSocket,destaddr:&SocketAddr,bytes:&Vec<u8>,padpath:&Path) -> Result<(),io::Error> {
+    let mut stampedbytes = bytes.clone();
+    stampedbytes.append(&mut int2bytes(&systime()).to_vec());
+	let payload = match encrypt(&stampedbytes,&padpath) {
+	    Err(why) => {
+	        return Err(why);
+	    },
+	    Ok(b) => b,
+	};
+	return sendraw(&listener,&destaddr,&payload);
 }
 
 fn main() {
@@ -418,23 +430,21 @@ fn main() {
 			window.clrtoeol();
 			window.addstr(&prompt);
 			window.refresh();
-			let authpayload = match encrypt(&int2bytes(&systime()).to_vec(),&padpath) {
+			match sendbytes(&listener,&serverhost,&vec![],&padpath) {
 				Err(why) => {
 					window.mv(window.get_cur_y(),0);
 					window.clrtoeol();
-					window.addstr(&format!("Could not encrypt payload for authentication - {}",why.description()));
+					window.addstr(&format!("Could not send authentication payload - {}",why.description()));
 					window.mv(0,0);
 					window.insdelln(-1);
 					window.mv(window.get_max_y()-1,0);
 					window.clrtoeol();
-					window.addstr(&prompt);
 					window.refresh();
 					sleep(Duration::new(5,0));
 					continue 'authtry;
 				},
-				Ok(payload) => payload,
+				Ok(_) => (),
 			};
-			let _ = sendbytes(&listener,&serverhost,&authpayload);
 			for _ in 0..10 {
 				sleep(Duration::new(0,100_000_000));
 				match listener.recv_from(&mut inbin) {
@@ -448,28 +458,90 @@ fn main() {
 							window.insdelln(-1);
 							window.mv(window.get_max_y()-1,0);
 							window.clrtoeol();
-							window.addstr(&prompt);
 							window.refresh();
 							sleep(Duration::new(5,0));
 							continue 'authtry;
 						},
 					},
 					Ok((nrecv,srcaddr)) => {
-						if nrecv == 1 && inbin[0] == 0x02 && srcaddr == serverhost {
+					    if nrecv == 25 && srcaddr == serverhost {
+						    match decrypt(&inbin[0..25].to_vec(),&padpath) {
+						        Ok(message) => match message[0] {
+						            0x02 => {
+							            window.mv(window.get_cur_y(),0);
+							            window.clrtoeol();
+							            window.addstr(&format!("Subscribed to server at {}.",serverhost));
+							            window.mv(0,0);
+							            window.insdelln(-1);
+							            window.mv(window.get_max_y()-1,0);
+							            window.clrtoeol();
+							            window.addstr(&prompt);
+							            window.refresh();
+							            break 'authtry;
+							        },
+							        0x19 => {
+							            window.mv(window.get_cur_y(),0);
+							            window.clrtoeol();
+							            window.addstr(&format!("Pad file is correct, but subscription rejected by server. Server may be full."));
+							            window.mv(0,0);
+							            window.insdelln(-1);
+							            window.mv(window.get_max_y()-1,0);
+							            window.clrtoeol();
+							            window.refresh();
+							            sleep(Duration::new(5,0));
+							        },
+							        other => {
+							            window.mv(window.get_cur_y(),0);
+							            window.clrtoeol();
+							            window.addstr(&format!("Server at {} sent an unknown status code {}. Is this the latest client version?",
+							                                                                                                serverhost,other));
+							            window.mv(0,0);
+							            window.insdelln(-1);
+							            window.mv(window.get_max_y()-1,0);
+							            window.clrtoeol();
+							            window.refresh();
+							            sleep(Duration::new(5,0));
+							        },
+							    }, // decrypt Ok
+							    Err(why) => match why.kind() {
+							        io::ErrorKind::InvalidData => {
+							            window.mv(window.get_cur_y(),0);
+							            window.clrtoeol();
+							            window.addstr(&format!("Response from server did not validate. Local pad file is incorrect or invalid."));
+							            window.mv(0,0);
+							            window.insdelln(-1);
+							            window.mv(window.get_max_y()-1,0);
+							            window.clrtoeol();
+							            window.refresh();
+							            sleep(Duration::new(5,0));
+							        }
+							        _ => {
+							            window.mv(window.get_cur_y(),0);
+							            window.clrtoeol();
+							            window.addstr(&format!("Failed to decrypt response from server - {}",why.description()));
+							            window.mv(0,0);
+							            window.insdelln(-1);
+							            window.mv(window.get_max_y()-1,0);
+							            window.clrtoeol();
+							            window.refresh();
+							            sleep(Duration::new(5,0));
+							        },
+							    }, // match why.kind
+                            }; // match inbin[0]
+                        } else { // if nrecv == 1
 							window.mv(window.get_cur_y(),0);
 							window.clrtoeol();
-							window.addstr(&format!("Subscribed to server {}.",serverhost));
+							window.addstr(&format!("Got invalid message of length {} from {}.",nrecv,srcaddr));
 							window.mv(0,0);
 							window.insdelln(-1);
 							window.mv(window.get_max_y()-1,0);
 							window.clrtoeol();
-							window.addstr(&prompt);
 							window.refresh();
-							break 'authtry;
-						}
-					},
-				};
-			}
+							sleep(Duration::new(5,0));
+                        }
+					}, // recv Ok
+				}; // match recv
+			} // for 0..10
 		} // 'authtry
 		// Yay! If we made it down here, that means we're successfully authenticated and
 		// subscribed, and can start doing the things this program is actually meant for.
@@ -497,10 +569,7 @@ fn main() {
 						if srcaddr != serverhost {
 							continue 'operator;
 						}
-						let _ = sendbytes(&listener,&srcaddr,&vec![0x06]);
-						if nrecv > 16 {
-							// payloads longer than 16 are long enough to contain a message (at least 1
-							// byte long), a checksum, and a nonce.
+						if nrecv > 24 {
 							if lastmsgs.contains(&inbin[0..nrecv].to_vec()) {
 								// Ignore the payload if it's a duplicate. This will never
 								// false-positive, because even repeated messages will be encrypted
@@ -530,7 +599,9 @@ fn main() {
 										window.clrtoeol();
 										window.addstr(&prompt);
 										window.refresh();
-										let _ = sendbytes(&listener,&srcaddr,&vec![0x15]);
+										let _ = sendbytes(&listener,&srcaddr,&vec![0x15],&padpath);
+										sleep(Duration::new(2,0));
+										break 'operator;
 									},
 									_ => {
 										// Other decryption error.
@@ -543,7 +614,7 @@ fn main() {
 										window.clrtoeol();
 										window.addstr(&prompt);
 										window.refresh();
-										let _ = sendbytes(&listener,&srcaddr,&vec![0x1A]);
+										let _ = sendbytes(&listener,&srcaddr,&vec![0x1A],&padpath);
 									},
 								},
 								Ok(message) => {
@@ -563,51 +634,53 @@ fn main() {
 									} else if msgtime - MSG_VALID_TIME > systime() {
 										msgstatus = format!(" [FUTURE]");
 						            }
-									window.mv(window.get_max_y()-1,0);
-									window.clrtoeol();
-									if switches.contains("--showhex") || flags.contains(&'h') {
-									    window.addstr(&format!("\r[REM]{}: {} [{}]",msgstatus,messagetext,bytes2hex(&messagechars)));
-									} else {
-									    window.addstr(&format!("\r[REM]{}: {}",msgstatus,messagetext));
+						            if nrecv == 25 && &msgstatus == "" {
+							            // payloads of one byte are messages from the server.
+							            if window.get_cur_y() > 0 {
+								            // Display response codes from the server on the right-hand side of
+								            // the terminal, on the same line as the outgoing message the
+								            // response corresponds to.
+								            window.mv(window.get_cur_y()-1,window.get_max_x()-4);
+								            window.clrtoeol();
+								            window.addstr(&bytes2hex(&vec![message[0]]));;
+								            window.mv(window.get_cur_y()+1,0);
+								            window.clrtoeol();
+								            window.addstr(&prompt);
+								            window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
+								            window.refresh();
+							            }
+							            if inbin[0] == 0x19 { // END OF MEDIUM
+								            // Handle deauthentications
+								            window.mv(window.get_cur_y(),0);
+								            window.clrtoeol();
+								            window.addstr(&format!("Subscription expiration notification received - renewing subscription to {}",serverhost));
+								            window.mv(0,0);
+								            window.insdelln(-1);
+								            window.mv(window.get_max_y()-1,0);
+								            window.clrtoeol();
+								            window.addstr(&prompt);
+								            window.refresh();
+								            continue 'recovery;
+							            }
+						            } else {
+									    window.mv(window.get_max_y()-1,0);
+									    window.clrtoeol();
+									    if switches.contains("--showhex") || flags.contains(&'h') {
+									        window.addstr(&format!("\r[REM]{}: {} [{}]",msgstatus,messagetext,bytes2hex(&messagechars)));
+									    } else {
+									        window.addstr(&format!("\r[REM]{}: {}",msgstatus,messagetext));
+									    }
+									    window.mv(0,0);
+									    window.insdelln(-1);
+									    window.mv(window.get_max_y()-1,0);
+									    window.clrtoeol();
+									    window.addstr(&prompt);
+									    window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
+									    window.refresh();
+									    let _ = sendbytes(&listener,&srcaddr,&vec![0x06],&padpath);
 									}
-									window.mv(0,0);
-									window.insdelln(-1);
-									window.mv(window.get_max_y()-1,0);
-									window.clrtoeol();
-									window.addstr(&prompt);
-									window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
-									window.refresh();
-									let _ = sendbytes(&listener,&srcaddr,&vec![0x06]);
-								}
+								},
 							};
-						} else if nrecv >= 1 {
-							// payloads of one byte are messages from the server.
-							if window.get_cur_y() > 0 {
-								// Display response codes from the server on the right-hand side of
-								// the terminal, on the same line as the outgoing message the
-								// response corresponds to.
-								window.mv(window.get_cur_y()-1,window.get_max_x()-4);
-								window.clrtoeol();
-								window.addstr(&bytes2hex(&vec![inbin[0]]));;
-								window.mv(window.get_cur_y()+1,0);
-								window.clrtoeol();
-								window.addstr(&prompt);
-								window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
-								window.refresh();
-							}
-							if inbin[0] == 0x19 { // END OF MEDIUM
-								// Handle deauthentications
-								window.mv(window.get_cur_y(),0);
-								window.clrtoeol();
-								window.addstr(&format!("Subscription expiration notification received - renewing subscription to {}",serverhost));
-								window.mv(0,0);
-								window.insdelln(-1);
-								window.mv(window.get_max_y()-1,0);
-								window.clrtoeol();
-								window.addstr(&prompt);
-								window.refresh();
-								continue 'recovery;
-							}
 						}
 					},
 				};
@@ -638,14 +711,8 @@ fn main() {
 							// isn't identical to this one.
 							linehistory.push(consoleline.clone());
 						}
-						// Timestamp the message and encrypt it, handling the typical battery of
-						// error conditions as they come.
-						let timestamp:[u8;8] = int2bytes(&systime());
-						let mut stampedmessage:Vec<u8> = Vec::new();
-						stampedmessage.append(&mut consoleline);
-						linepos = 0;
-						stampedmessage.append(&mut timestamp.to_vec());
-						let payload:Vec<u8> = match encrypt(&stampedmessage,&padpath) {
+						// Send (and encrypt) the message.
+						match sendbytes(&listener,&serverhost,&consoleline,&padpath) {
 							Err(why) => {
 								window.mv(window.get_cur_y(),0);
 								window.clrtoeol();
@@ -658,10 +725,10 @@ fn main() {
 								window.refresh();
 								continue 'operator;
 							},
-							Ok(payload) => payload,
+						    Ok(_) => (),
 						};
-						// If encryption succeeded, transmit the resulting payload, and we're done.
-						let _ = sendbytes(&listener,&serverhost,&payload);
+						consoleline = Vec::new();
+						linepos = 0;
 					},
 					0x7F|0x08 => { // DEL
 						// Handles both backspace and delete the same way, by knocking out the

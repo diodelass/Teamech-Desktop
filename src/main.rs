@@ -409,6 +409,15 @@ fn main() {
 		window.mv(window.get_max_y()-1,0); // go to the bottom left corner
 		window.refresh();
 		'authtry:loop {
+			window.mv(window.get_cur_y(),0);
+			window.clrtoeol();
+			window.addstr(&format!("Trying to contact server..."));
+			window.mv(0,0);
+			window.insdelln(-1);
+			window.mv(window.get_max_y()-1,0);
+			window.clrtoeol();
+			window.addstr(&prompt);
+			window.refresh();
 			let authpayload = match encrypt(&int2bytes(&systime()).to_vec(),&padpath) {
 				Err(why) => {
 					window.mv(window.get_cur_y(),0);

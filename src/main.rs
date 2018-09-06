@@ -642,7 +642,7 @@ fn main() {
 								            // response corresponds to.
 								            window.mv(window.get_cur_y()-1,window.get_max_x()-4);
 								            window.clrtoeol();
-								            window.addstr(&bytes2hex(&vec![message[0]]));;
+								            window.addstr(format!("0x{}",&bytes2hex(&vec![message[0]])));
 								            window.mv(window.get_cur_y()+1,0);
 								            window.clrtoeol();
 								            window.addstr(&prompt);

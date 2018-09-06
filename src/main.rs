@@ -62,10 +62,19 @@
  * be a particularly egregious vulnerability, since the encryption is primarily intended for
  * authentication and for ensuring that an attacker cannot obtain up-to-date information about the
  * system. 
+ 
+ *
+ * COMMAND-LINE FLAGS
+ *
+ * --showhex / -h 
+ *      Prints the hex values of all sent and received characters after the lossy-utf8 string
+ *      version in the console. Useful if dealing in messages which are binary and not
+ *      human-readable.
+ *
 
 Cargo.toml:
 [package]
-name = "alla-teamech"
+name = "teamech-console"
 version = "0.2.0"
 authors = ["ellie"]
 
@@ -91,6 +100,7 @@ use std::io;
 use std::io::prelude::*;
 use std::time::{Duration,SystemTime,UNIX_EPOCH};
 use std::net::{UdpSocket,SocketAddr,ToSocketAddrs};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -296,11 +306,10 @@ fn sendbytes(listener:&UdpSocket,destaddr:&SocketAddr,bytes:&Vec<u8>) -> Result<
 				// WouldBlock for a send operation usually means that the transmit buffer is full.
 				io::ErrorKind::Interrupted => (),
 				io::ErrorKind::WouldBlock => {
-					println!("Error: failed to send byte - transmit buffer overflow!");
+					// Transmit buffer overflow!
 					return Err(why);
 				},
 				_ => {
-					println!("Error: failed to send byte - {}",why.description());
 					return Err(why);
 				},
 			},
@@ -309,12 +318,26 @@ fn sendbytes(listener:&UdpSocket,destaddr:&SocketAddr,bytes:&Vec<u8>) -> Result<
 }
 
 fn main() {
-	let argv:Vec<String> = args().collect();
-	if argv.len() < 3 || argv.len() > 4 {
+	if args().count() < 3 || args().count() > 4 {
 		// If the user provides the wrong number of arguments, remind them of how to use this program.
-		println!("Usage: alla-teamech [host:remoteport] [localport] [keyfile]");
+		println!("Usage: teamech-console [host:remoteport] [localport] [keyfile]");
 		process::exit(1);
 	}
+	let mut argv:Vec<String> = Vec::new();
+	let mut flags:HashSet<char> = HashSet::new();
+	let mut switches:HashSet<String> = HashSet::new();
+    for arg in args() {
+        // bin arguments into -flags, --switches, and positional arguments.
+        if arg.starts_with("--") {
+            let _ = switches.insert(arg);
+        } else if arg.starts_with("-") {
+            for c in arg.as_bytes()[1..arg.len()].iter() {
+                let _ = flags.insert(*c as char);
+            }
+        } else {
+            argv.push(arg);
+        }
+    }
 	let mut port:u16 = 0;
 	let mut padpath:&Path = Path::new("");
 	// If a port number was specified (3 arguments), try to parse it and use it. If the second
@@ -370,7 +393,7 @@ fn main() {
 			},
 		}
 		// Set up some system state machinery
-		let mut inbin:[u8;400] = [0;400]; // input buffer for receiving bytes
+		let mut inbin:[u8;500] = [0;500]; // input buffer for receiving bytes
 		let mut lastmsgs:Vec<Vec<u8>> = Vec::new(); // keeps track of messages that have already been received, to merge double-sends.
 		let mut consoleline:Vec<u8> = Vec::new(); // the bytestring holding the text currently typed into the console line editor
 		let mut linehistory:Vec<Vec<u8>> = Vec::new(); // the history of text entered at the console, for up-arrow message repeating
@@ -378,241 +401,55 @@ fn main() {
 		let mut linepos:usize = 0; // the position of the cursor in the console line
 		// ncurses machinery (for the fancy console display stuff)
 		let window = initscr();
-		let prompt:&str = "[alla-teamech]-> ";
+		let prompt:&str = "[teamech]-> ";
 		window.refresh(); // must be called every time the screen is to be updated.
 		window.keypad(true); // keypad mode, which is typical 
 		window.nodelay(true); // nodelay mode, which ensures that the window is actually updated on time
 		noecho(); // prevent local echo, since we'll be handling that ourselves
 		window.mv(window.get_max_y()-1,0); // go to the bottom left corner
 		window.refresh();
-		// Begin attempts to authenticate with the server. 
-		// Authentication attempts are handled by three loops, in the structure
-		// 'authtry {
-		//		'authget { }
-		//		'authwait { }
-		//	}
-		//	If an error condition that requires restarting the authentication process happens, the
-		//	thing to do is `continue 'authtry;`
-		let mut authstart:u64 = systime();
 		'authtry:loop {
-			window.mv(window.get_cur_y(),0);
-			window.clrtoeol();
-			window.addstr(&format!("Soliciting authentication nonce from {}...",serverhost));
-			window.mv(0,0);
-			window.insdelln(-1);
-			window.mv(window.get_max_y()-1,0);
-			window.clrtoeol();
-			window.refresh();
-			let _ = sendbytes(&listener,&serverhost,&vec![0x01]); // START OF HEADING - request an authentication nonce.
-			'authget:loop {
-				if systime() > authstart+10_000 {
-					// Check if we've been waiting more than 10 seconds for a nonce to come back.
-					// If so, we should send another request (start over).
-					authstart = systime();
+			let authpayload = match encrypt(&int2bytes(&systime()).to_vec(),&padpath) {
+				Err(why) => {
+					window.mv(window.get_cur_y(),0);
+					window.clrtoeol();
+					window.addstr(&format!("Could not encrypt payload for authentication - {}",why.description()));
+					window.mv(0,0);
+					window.insdelln(-1);
+					window.mv(window.get_max_y()-1,0);
+					window.clrtoeol();
+					window.addstr(&prompt);
+					window.refresh();
+					sleep(Duration::new(5,0));
 					continue 'authtry;
-				}
+				},
+				Ok(payload) => payload,
+			};
+			let _ = sendbytes(&listener,&serverhost,&authpayload);
+			for _ in 0..10 {
+				sleep(Duration::new(0,100_000_000));
 				match listener.recv_from(&mut inbin) {
 					Err(why) => match why.kind() {
-						io::ErrorKind::WouldBlock => {
-							// Nothing ready to receive yet - wait for a millisecond and try again.
-							sleep(Duration::new(0,1_000_000));
-							continue 'authget;
-						}
+						io::ErrorKind::WouldBlock => (),
 						_ => {
-							// Error condition: there's a real problem. Wait 5 seconds and try
-							// again, since there's nothing better to do I guess.
-							// If the user gets something out of the error message, they can decide
-							// to terminate the program.
 							window.mv(window.get_cur_y(),0);
 							window.clrtoeol();
-							window.addstr(&format!("Could not receive packet: {}. Trying again in 5 seconds...",why.description()));
-							window.mv(0,0);
-							window.insdelln(-1);
-							window.mv(window.get_max_y()-1,0);
-							window.clrtoeol();
-							window.refresh();
-							sleep(Duration::new(5,0));
-						},
-					},
-					Ok((nrecv,srcaddr)) => {
-						// Ok - we have a packet.
-						if srcaddr != serverhost {
-							// If the packet wasn't from the server we want, throw it out and go
-							// back to waiting, but not before warning the user.
-							window.mv(window.get_cur_y(),0);
-							window.clrtoeol();
-							window.addstr(&format!("Warning: Received packet [{}] from unexpected address {}",bytes2hex(&inbin[0..nrecv].to_vec()),srcaddr));
-							window.mv(0,0);
-							window.insdelln(-1);
-							window.mv(window.get_max_y()-1,0);
-							window.clrtoeol();
-							window.refresh();
-							continue 'authget;
-						}
-						if nrecv == 25 && inbin[0] == 0x01 {
-							// If this message looks like the right kind of thing to be a nonce
-							// (25 bytes starting with 0x01), try to decrypt it and verify it.
-							let authnoncecrypt:Vec<u8> = inbin[1..25].to_vec();
-							let authnonce = match decrypt(&authnoncecrypt,&padpath) {
-								Err(why) => match why.kind() {
-									io::ErrorKind::InvalidData => {
-										// The server sent us an encrypted nonce that we couldn't
-										// decrypt. This probably means that we're not using the
-										// same key as the server, and thus can't subscribe to it.
-										// We won't quit the program as this would make the
-										// message disappear, but we will wait for an arbitrarily
-										// long amount of time after displaying it before trying
-										// again, because it's probably not gonna work.
-										window.mv(window.get_cur_y(),0);
-										window.clrtoeol();
-										window.addstr("Warning: Nonce failed to validate. This server is probably not using our key.");
-										window.mv(0,0);
-										window.insdelln(-1);
-										window.mv(window.get_max_y()-1,0);
-										window.clrtoeol();
-										window.refresh();
-										sleep(Duration::new(60,0));
-										continue 'authtry;
-									},
-									_ => {
-										// Unrelated client-side error occurred while trying to
-										// decrypt the nonce. We'll try starting over.
-										window.mv(window.get_cur_y(),0);
-										window.clrtoeol();
-										window.addstr(&format!("Could not decrypt authentication nonce - {}",why.description()));
-										window.mv(0,0);
-										window.insdelln(-1);
-										window.mv(window.get_max_y()-1,0);
-										window.clrtoeol();
-										window.refresh();
-										sleep(Duration::new(5,0));
-										continue 'authtry;
-									},
-								},
-								Ok(nonce) => nonce,
-							};
-							// Receiving and decrypting the nonce was successful. Beginning phase 2
-							// (retransmission).
-							window.mv(window.get_cur_y(),0);
-							window.clrtoeol();
-							window.addstr(&format!("Authentication nonce received. Sending authentication response..."));
-							window.mv(0,0);
-							window.insdelln(-1);
-							window.mv(window.get_max_y()-1,0);
-							window.clrtoeol();
-							window.refresh();
-							let mut authcrypt:Vec<u8> = match encrypt(&authnonce,&padpath) {
-								Err(why) => {
-									// Problem happened while trying to encrypt the nonce again -
-									// this is a bit odd to have happen, since the encryption
-									// machinery being broken probably would have been caught while
-									// decryting the nonce, but this is still a possible case.
-									window.mv(window.get_cur_y(),0);
-									window.clrtoeol();
-									window.addstr(&format!("Could not recrypt authentication nonce - {}",why.description()));
-									window.mv(0,0);
-									window.insdelln(-1);
-									window.mv(window.get_max_y()-1,0);
-									window.clrtoeol();
-									window.refresh();
-									sleep(Duration::new(5,0));
-									continue 'authtry;
-								},
-								Ok(crypt) => crypt,
-							};
-							// Encryption succeeded - time to assemble our response packet.
-							let mut authresponse:Vec<u8> = vec![0x02];
-							authresponse.append(&mut authcrypt);
-							let _ = sendbytes(&listener,&serverhost,&authresponse);
-							// Response away - commence waiting for the verdict.
-							break 'authget;
-						} else if nrecv == 1 && (inbin[0] == 0x15 || inbin[0] == 0x1A) { // NAK or SUBSTITUTE
-							// Whoops - the server rejected our auth response? This could be for
-							// any number of reasons, but is most likely a transient issue that
-							// will resolve itself (e.g. the server's recv buffer is full).
-							window.mv(window.get_cur_y(),0);
-							window.clrtoeol();
-							window.addstr(&format!("Server declined authentication nonce request. Trying again in 5 seconds..."));
-							window.mv(0,0);
-							window.insdelln(-1);
-							window.mv(window.get_max_y()-1,0);
-							window.clrtoeol();
-							window.refresh();
-							sleep(Duration::new(5,0));
-							continue 'authtry;
-						} else if nrecv == 0 {
-							// Got an empty packet? That's weird, but I guess we'll just keep
-							// listening.
-							sleep(Duration::new(0,1_000_000));
-							continue 'authget;
-						} else {
-							// Unknown response? That's weird. Maybe this isn't actually a Teamech
-							// server? I guess we'll try again...
-							window.mv(window.get_cur_y(),0);
-							window.clrtoeol();
-							window.addstr(&format!("Unknown response code {:x?} (length {})",inbin[0],nrecv));
-							window.mv(0,0);
-							window.insdelln(-1);
-							window.mv(window.get_max_y()-1,0);
-							window.clrtoeol();
-							window.refresh();
-							sleep(Duration::new(5,0));
-							continue 'authtry;
-						}
-					},
-				};
-			} // 'authget
-			'authwait:loop {
-				// Wait for the verdict to come back - whether the server accepted our
-				// authentication or not. Since this client won't send anything if the challenge
-				// didn't verify, there's almost no chance of getting nixed here unless the pad
-				// file is partially corrupt.
-				if systime() > authstart+10_000 {
-					// If we've been waiting for more than ten seconds, give up and start over.
-					authstart = systime();
-					continue 'authtry;
-				}
-				match listener.recv_from(&mut inbin) {
-					Err(why) => match why.kind() {
-						io::ErrorKind::WouldBlock => {
-							// Nothing to find for now, wait a millisecond and try again
-							sleep(Duration::new(0,1_000_000));
-							continue 'authwait;
-						}
-						_ => {
-							// Some kind of recv error, usual error handling for that here
-							window.mv(window.get_cur_y(),0);
-							window.clrtoeol();
-							window.addstr(&format!("Could not receive packet: {}. Trying again in 5 seconds...",why.description()));
+							window.addstr(&format!("Could not receive authentication response - {}",why.description()));
 							window.mv(0,0);
 							window.insdelln(-1);
 							window.mv(window.get_max_y()-1,0);
 							window.clrtoeol();
 							window.addstr(&prompt);
+							window.refresh();
 							sleep(Duration::new(5,0));
+							continue 'authtry;
 						},
 					},
 					Ok((nrecv,srcaddr)) => {
-						// Got something
-						if srcaddr != serverhost {
-							// another weird unrelated packet from the wrong address? Warn user and
-							// keep listening.
+						if nrecv == 1 && inbin[0] == 0x02 && srcaddr == serverhost {
 							window.mv(window.get_cur_y(),0);
 							window.clrtoeol();
-							window.addstr(&format!("Warning: Received packet [{}] from unexpected address {}",bytes2hex(&inbin[0..nrecv].to_vec()),srcaddr));
-							window.mv(0,0);
-							window.insdelln(-1);
-							window.mv(window.get_max_y()-1,0);
-							window.clrtoeol();
-							window.refresh();
-							continue 'authwait;
-						}
-						if nrecv == 1 && inbin[0] == 0x02 {
-							// Aha! We've been approved. We can break the 'authtry loop now and get
-							// on with the rest of the stuff this program does.
-							window.mv(window.get_cur_y(),0);
-							window.clrtoeol();
-							window.addstr(&format!("Authentication confirmed. Subscription to {} established.",serverhost));
+							window.addstr(&format!("Subscribed to server {}.",serverhost));
 							window.mv(0,0);
 							window.insdelln(-1);
 							window.mv(window.get_max_y()-1,0);
@@ -620,41 +457,10 @@ fn main() {
 							window.addstr(&prompt);
 							window.refresh();
 							break 'authtry;
-						} else if nrecv == 1 && inbin[0] == 0x19 {
-							// Denied. This is actually a pretty weird case, because decrypting the
-							// nonce shouldn't have worked if the pad files were different. This is
-							// most likely to occur with a partially-corrupt pad file.
-							window.mv(window.get_cur_y(),0);
-							window.clrtoeol();
-							window.addstr("Authentication failure - access denied. Ensure key is correct?");
-							window.mv(0,0);
-							window.insdelln(-1);
-							window.mv(window.get_max_y()-1,0);
-							window.clrtoeol();
-							window.addstr(&prompt);
-							window.refresh();
-							sleep(Duration::new(60,0));
-							continue 'authtry;
-						} else if nrecv == 0 {
-							// empty packet? weird.
-							sleep(Duration::new(0,1_000_000));
-							continue 'authwait;
-						} else {
-							// Unknown response code? weird.
-							window.mv(window.get_cur_y(),0);
-							window.clrtoeol();
-							window.addstr(&format!("Unknown response code {}.",bytes2hex(&vec![inbin[0]])));
-							window.mv(0,0);
-							window.insdelln(-1);
-							window.mv(window.get_max_y()-1,0);
-							window.clrtoeol();
-							window.addstr(&prompt);
-							window.refresh();
-							continue 'authtry;
 						}
 					},
 				};
-			} // 'authwait
+			}
 		} // 'authtry
 		// Yay! If we made it down here, that means we're successfully authenticated and
 		// subscribed, and can start doing the things this program is actually meant for.
@@ -737,23 +543,24 @@ fn main() {
 									// (either too far in the future or too far in the past), but
 									// since this is a human-facing client, we just want to flag
 									// these messages, not hide them completely.
-									let mut messagetext:String = String::from_utf8_lossy(&message[0..message.len()-8]).to_string();
+									let messagechars:Vec<u8> = message[0..message.len()-8].to_vec();
+									let mut messagetext:String = String::from_utf8_lossy(&messagechars).to_string();
 									let mut timestamp:[u8;8] = [0;8];
 									timestamp.copy_from_slice(&message[message.len()-8..message.len()]);
 									let msgtime:u64 = bytes2int(&timestamp);
+									let mut msgstatus:String = String::new();
 									if msgtime + MSG_VALID_TIME < systime() {
-										messagetext = format!("[OUTDATED] {}",messagetext);
+										msgstatus = format!(" [OUTDATED]");
 									} else if msgtime - MSG_VALID_TIME > systime() {
-										messagetext = format!("[FUTURE] {}",messagetext);
-									}
-									window.mv(window.get_cur_y(),0);
-									window.clrtoeol();
-									window.addstr(format!("[RECV] {}",bytes2hex(&inbin[0..nrecv].to_vec())));
-									window.mv(0,0);
-									window.insdelln(-1);
+										msgstatus = format!(" [FUTURE]");
+						            }
 									window.mv(window.get_max_y()-1,0);
 									window.clrtoeol();
-									window.addstr(&format!("\r[REM]: {}",messagetext));
+									if switches.contains("--showhex") || flags.contains(&'h') {
+									    window.addstr(&format!("\r[REM]{}: {} [{}]",msgstatus,messagetext,bytes2hex(&messagechars)));
+									} else {
+									    window.addstr(&format!("\r[REM]{}: {}",msgstatus,messagetext));
+									}
 									window.mv(0,0);
 									window.insdelln(-1);
 									window.mv(window.get_max_y()-1,0);
@@ -805,7 +612,11 @@ fn main() {
 						// above the input line.
 						window.mv(window.get_cur_y(),0);
 						window.clrtoeol();
-						window.addstr(&format!("\r[LOC]: {}",String::from_utf8_lossy(&consoleline)));
+						if switches.contains("--showhex") || flags.contains(&'h') {
+						    window.addstr(&format!("\r[LOC]: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
+						} else {
+						    window.addstr(&format!("\r[LOC]: {}",String::from_utf8_lossy(&consoleline)));
+						}
 						window.mv(0,0);
 						window.insdelln(-1);
 						window.mv(window.get_max_y()-1,0);
@@ -822,7 +633,7 @@ fn main() {
 						// error conditions as they come.
 						let timestamp:[u8;8] = int2bytes(&systime());
 						let mut stampedmessage:Vec<u8> = Vec::new();
-						stampedmessage.append(&mut consoleline.clone());
+						stampedmessage.append(&mut consoleline);
 						linepos = 0;
 						stampedmessage.append(&mut timestamp.to_vec());
 						let payload:Vec<u8> = match encrypt(&stampedmessage,&padpath) {
@@ -842,15 +653,6 @@ fn main() {
 						};
 						// If encryption succeeded, transmit the resulting payload, and we're done.
 						let _ = sendbytes(&listener,&serverhost,&payload);
-						window.mv(window.get_cur_y(),0);
-						window.clrtoeol();
-						window.addstr(format!("[SEND] {}",bytes2hex(&consoleline)));
-						window.mv(0,0);
-						window.insdelln(-1);
-						window.mv(window.get_max_y()-1,0);
-						window.clrtoeol();
-						window.addstr(&prompt);
-						window.refresh();
 					},
 					0x7F|0x08 => { // DEL
 						// Handles both backspace and delete the same way, by knocking out the

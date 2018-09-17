@@ -1,10 +1,10 @@
 /* Teamech Desktop Client v0.2
  * September 2018
- * License: GPL v3.0
+ * License: AGPL v3.0
  *
  * This source code is provided with ABSOLUTELY NO WARRANTY. You are fully responsible for any
  * operations that your computers carry out as a result of running this code or anything derived
- * from it. The developer assumes the full absolution of liability described in the GPL v3.0
+ * from it. The developer assumes the full absolution of liability described in the AGPL v3.0
  * license.
  * 
  * OVERVIEW
@@ -22,47 +22,6 @@
  * Teamech server. The distribution in which you received this file should also contain the source
  * code for the server.
  *
- * MODE OF OPERATION
- * Teamech uses UDP for its transport layer. As a result, it uses no connections, packets arrive in
- * arbitrary order, and there is no guarantee that any packet will arrive at its destination. In
- * lieu of connections, Teamech operates in terms of "subscriptions" - clients authenticate with
- * the server in order to subscribe, at which point they are recorded in the server's directory of
- * active subscribers and sent subsequent messages from the server. Each time a client sends a
- * message to the server to be distributed, its subscription is renewed; subscriptions older than a
- * set duration with no activity (usually 5-60 minutes, depending on application) are considered
- * expired and automatically closed. Clients must open a subscription before their messages are
- * relayed to other clients.
- *
- * SECURITY
- * The Teacrypt protocol is used for secrecy, validation, and mutual authentication of clients and
- * servers. Teamech does not support messages which are not encrypted using Teacrypt; in addition,
- * the clients passing messages through Teamech must use the same encryption key as the server. In
- * a typical implementation, the server is assumed to be as secure as the client devices, and is
- * as such involved in monitoring and logging communications passed through it. (If this sounds
- * scary to you, take note that this is intended as a local-area mini-SCADA system, not an
- * international encrypted messenger for human-to-human messages.) Teacrypt pads (key files) consist 
- * of large (usually at least 10 MB) files of variable size, which are symmetric between clients and
- * servers. Each message is encrypted with a unique key generated from the pad file and signed with
- * a unique shared secret. Upon receiving a message, the server decrypts it, logs its contents, and
- * verifies its message signature. If the signature validates, then the original encrypted payload
- * is forwarded to all other subscribers. Any subscriber that sends a message whose signature fails
- * to validate has its subscription summarily invalidated and must reauthenticate (as this is most
- * likely to happen with already-authenticated subscribers as a result of a man-in-the-middle or 
- * similar attack).
- * As no client can generate a message whose signature validates without possession of the pad
- * file, this prevents the server from being hijacked for malicious use in addition to
- * authenticating all packets.
- * It should be noted that any string of data at least 25 bytes long can be decrypted using any key
- * with Teacrypt - it simply will not produce a coherent message with a valid signature unless it
- * was generated using Teacrypt with the same key. As a result, failure of a payload to validate
- * should not be construed as an attempted attack, as it may have just been the result of
- * attempting to decrypt something that was not a Teacrypt-encrypted payload.
- * Teacrypt does not offer forward security (in that an attacker who manages to obtain the key can
- * then decrypt all old messages whose ciphertext they have saved), but this is not considered to
- * be a particularly egregious vulnerability, since the encryption is primarily intended for
- * authentication and for ensuring that an attacker cannot obtain up-to-date information about the
- * system. 
- 
  *
  * COMMAND-LINE FLAGS
  *

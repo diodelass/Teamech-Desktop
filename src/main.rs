@@ -1,4 +1,4 @@
-/* Teamech Desktop Client v0.2
+/* Teamech Desktop Client v0.4
  * September 2018
  * License: AGPL v3.0
  *
@@ -34,70 +34,98 @@
 Cargo.toml:
 [package]
 name = "teamech-console"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["ellie"]
 
 [dependencies]
 tiny-keccak = "1.4.2"
 rand = "0.3"
 pancurses = "0.16"
+dirs = "1.0.3"
+chrono = "0.4"
+byteorder = "1"
 
  */
 
-static MSG_VALID_TIME:u64 = 10_000; // Tolerance interval in ms for packet timestamps outside of which to mark them as suspicious
+static MSG_VALID_TIME:i64 = 10_000; // Tolerance interval in ms for packet timestamps outside of which to mark them as suspicious
+static LOG_DIRECTORY:&str = ".teamech-logs/desktop";
+static PROMPT:&str = "[teamech]-> ";
 
 extern crate rand;
+
 extern crate tiny_keccak;
-extern crate pancurses;
 use tiny_keccak::Keccak;
+
+extern crate pancurses;
 use pancurses::*;
+
+extern crate dirs;
+use dirs::home_dir;
+
+extern crate chrono;
+use chrono::prelude::*;
+
+extern crate byteorder;
+use byteorder::{LittleEndian,ReadBytesExt,WriteBytesExt};
+
 use std::env::args;
+use std::time::Duration;
 use std::process;
 use std::thread::sleep;
 use std::error::Error;
 use std::io;
 use std::io::prelude::*;
-use std::time::{Duration,SystemTime,UNIX_EPOCH};
 use std::net::{UdpSocket,SocketAddr,ToSocketAddrs};
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path,PathBuf};
 
-// gets the unixtime in milliseconds.
-fn systime() -> u64 {
-	match SystemTime::now().duration_since(UNIX_EPOCH) {
-		Ok(time) => {
-			return time.as_secs()*1_000 + (time.subsec_nanos() as u64)/1_000_000 ;
+fn i64_bytes(number:&i64) -> [u8;8] {
+	let mut bytes:[u8;8] = [0;8];
+	match bytes.as_mut().write_i64::<LittleEndian>(*number) {
+		Err(why) => {
+			println!("FATAL: Could not convert integer to little-endian bytes: {}",why.description());
+			process::exit(1);
 		},
-		Err(_why) => {
-			return 0;
+		Ok(_) => (),
+	};
+	return bytes;
+}
+
+fn u64_bytes(number:&u64) -> [u8;8] {
+	let mut bytes:[u8;8] = [0;8];
+	match bytes.as_mut().write_u64::<LittleEndian>(*number) {
+		Err(why) => {
+			println!("FATAL: Could not convert integer to little-endian bytes: {}",why.description());
+			process::exit(1);
 		},
+		Ok(_) => (),
+	};
+	return bytes;
+}
+
+fn bytes_i64(bytes:&[u8;8]) -> i64 {
+	return match bytes.as_ref().read_i64::<LittleEndian>() {
+		Err(why) => {
+			println!("FATAL: Could not convert little-endian bytes to integer: {}",why.description());
+			process::exit(1);
+		},
+		Ok(n) => n,
 	};
 }
 
-// int2bytes: splits up an unsigned 64-bit int into eight bytes (unsigned 8-bit ints).
-// Endianness is preserved, but Teamech still needs to modified for big endian because the
-// specification requires that all messages be little endian.
-fn int2bytes(n:&u64) -> [u8;8] {
-	let mut result:[u8;8] = [0;8];
-	for i in 0..8 {
-		result[7-i] = (0xFF & (*n >> i*8)) as u8;
-	}
-	return result;
-}
-
-// bytes2int: Inverse of the above. Combines eight bytes into one 64-bit int.
-// Same endianness concerns as above apply.
-fn bytes2int(b:&[u8;8]) -> u64 {
-	let mut result:u64 = 0;
-	for i in 0..8 {
-		result += (b[i] as u64)*2u64.pow(((7-i) as u32)*8u32);
-	}
-	return result;
+fn bytes_u64(bytes:&[u8;8]) -> u64 {
+	return match bytes.as_ref().read_u64::<LittleEndian>() {
+		Err(why) => {
+			println!("FATAL: Could not convert little-endian bytes to integer: {}",why.description());
+			process::exit(1);
+		},
+		Ok(n) => n,
+	};
 }
 
 // bytes2hex converts a vector of bytes into a hexadecimal string. This is used mainly for
-// // debugging, when printing a binary string.
+// debugging, when printing a binary string.
 fn bytes2hex(v:&Vec<u8>) -> String {
 	let mut result:String = String::from("");
 	for x in 0..v.len() {
@@ -113,6 +141,76 @@ fn bytes2hex(v:&Vec<u8>) -> String {
 		}
 	}
 	return result;
+}
+
+// prints a line to the ncurses window - useful for condensing this common and lengthy invocation elsewhere.
+fn windowprint(window:&Window,line:&str) {
+	window.mv(window.get_cur_y(),0);
+	window.clrtoeol();
+	window.addstr(&line);
+	window.mv(0,0);
+	window.insdelln(-1);
+	window.mv(window.get_max_y()-1,0);
+	window.clrtoeol();
+	window.addstr(&PROMPT);
+	window.refresh();
+}
+
+// prints a line to the ncurses window and also logs it.
+fn windowlog(window:&Window,logfile:&Path,line:&str) {
+	log(&window,&logfile,&line);
+	window.mv(window.get_cur_y(),0);
+	window.clrtoeol();
+	window.addstr(&line);
+	window.mv(0,0);
+	window.insdelln(-1);
+	window.mv(window.get_max_y()-1,0);
+	window.clrtoeol();
+	window.addstr(&PROMPT);
+	window.refresh();
+}
+
+// Accepts a path to a log file, and writes a line to it, generating a human- and machine-readable log.
+fn logtofile(logfilename:&Path,logstring:&str,timestamp:DateTime<Local>) -> Result<(),io::Error> {
+	let userhome:PathBuf = match home_dir() {
+		None => PathBuf::new(),
+		Some(pathbuf) => pathbuf,
+	};
+	let logdir:&Path = &userhome.as_path().join(&LOG_DIRECTORY);
+	match fs::create_dir_all(&logdir) {
+		Err(why) => return Err(why),
+		Ok(_) => (),
+	};
+	let logpath:&Path = &logdir.join(&logfilename);
+	let mut logfile = match fs::OpenOptions::new() 
+										.append(true)
+										.open(&logpath) {
+		Ok(file) => file,
+		Err(why) => match why.kind() {
+			io::ErrorKind::NotFound => match fs::File::create(&logpath) {
+				Ok(file) => file,
+				Err(why) => return Err(why),
+			},
+			_ => return Err(why),
+		},
+	};
+	match writeln!(logfile,"[{}][{}] {}",timestamp.timestamp_millis(),timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),&logstring) {
+		Ok(_) => return Ok(()),
+		Err(why) => return Err(why),
+	};
+}
+
+// Error-handling wrapper for logtofile() - rather than returning an error, prints the error
+// message to the console and returns nothing.
+// invocation template: log(&window,&
+fn log(window:&Window,logfilename:&Path,logstring:&str) {
+	let timestamp:DateTime<Local> = Local::now();
+	match logtofile(&logfilename,&logstring,timestamp) {
+		Err(why) => {
+			windowprint(&window,&format!("ERROR: Failed to write to log file at {}: {}",logfilename.display(),why.description()));
+		},
+		Ok(()) => (),
+	};
 }
 
 // Teacrypt implementation: Generate single-use key and secret seed.
@@ -148,7 +246,7 @@ fn keygen(nonce:&[u8;8],padpath:&Path,keysize:&usize) -> Result<(Vec<u8>,Vec<u8>
 		}
 		sha3.finalize(&mut newseednonce);
 		seednonce = newseednonce;
-		let _ = padfile.seek(io::SeekFrom::Start(bytes2int(&seednonce) % padsize));
+		let _ = padfile.seek(io::SeekFrom::Start(bytes_u64(&seednonce) % padsize));
 		let _ = padfile.read_exact(&mut inbin);
 		seed[x] = inbin[0];
 	}
@@ -167,7 +265,7 @@ fn keygen(nonce:&[u8;8],padpath:&Path,keysize:&usize) -> Result<(Vec<u8>,Vec<u8>
 		}
 		sha3.finalize(&mut newkeynonce);
 		keynonce = newkeynonce;
-		let _ = padfile.seek(io::SeekFrom::Start(bytes2int(&keynonce) % padsize));
+		let _ = padfile.seek(io::SeekFrom::Start(bytes_u64(&keynonce) % padsize));
 		let _ = padfile.read_exact(&mut inbin);
 		keybytes.push(inbin[0]);
 	}
@@ -180,7 +278,7 @@ fn keygen(nonce:&[u8;8],padpath:&Path,keysize:&usize) -> Result<(Vec<u8>,Vec<u8>
 // signature, and nonce).
 fn encrypt(message:&Vec<u8>,padpath:&Path) -> Result<Vec<u8>,io::Error> {
 	let nonce:u64 = rand::random::<u64>();
-	let noncebytes:[u8;8] = int2bytes(&nonce);
+	let noncebytes:[u8;8] = u64_bytes(&nonce);
 	let keysize:usize = message.len()+8;
 	// Use the keygen function to create a key of length n + 8, where n is the length of the
 	// message to be encrypted. (The extra eight bytes are for encrypting the signature.)
@@ -278,7 +376,7 @@ fn sendraw(listener:&UdpSocket,destaddr:&SocketAddr,payload:&Vec<u8>) -> Result<
 // Automatically encrypts a vector of bytes and sends them over the socket.
 fn sendbytes(listener:&UdpSocket,destaddr:&SocketAddr,bytes:&Vec<u8>,padpath:&Path) -> Result<(),io::Error> {
     let mut stampedbytes = bytes.clone();
-    stampedbytes.append(&mut int2bytes(&systime()).to_vec());
+    stampedbytes.append(&mut i64_bytes(&Local::now().timestamp_millis()).to_vec());
 	let payload = match encrypt(&stampedbytes,&padpath) {
 	    Err(why) => {
 	        return Err(why);
@@ -340,6 +438,23 @@ fn main() {
 		// Recovery and operator loop structure is similar to that used in the server; the operator
 		// loop runs constantly while the program is active, while the recovery loop catches breaks
 		// from the operator and smoothly restarts the program in the event of a problem.
+		// ncurses machinery (for the fancy console display stuff)
+		let window = initscr();
+		window.refresh(); // must be called every time the screen is to be updated.
+		window.keypad(true); // keypad mode, which is typical 
+		window.nodelay(true); // nodelay mode, which ensures that the window is actually updated on time
+		noecho(); // prevent local echo, since we'll be handling that ourselves
+		window.mv(window.get_max_y()-1,0); // go to the bottom left corner
+		window.refresh();
+		let logfilename:String = format!("{}-teamech-desktop.log",Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+		let logfile:&Path = Path::new(&logfilename);
+		match logtofile(&logfile,&format!("Opened log file"),Local::now()) {
+			Err(why) => {
+				windowprint(&window,&format!("WARNING: Could not open log file at {} - {}. Logs are currently NOT BEING SAVED - you should fix this!",
+																												logfile.display(),why.description()));
+			},
+			Ok(_) => (),
+		};
 		let listener:UdpSocket = match UdpSocket::bind(&format!("0.0.0.0:{}",port)) {
 			Ok(socket) => socket,
 			Err(why) =>	{
@@ -370,35 +485,11 @@ fn main() {
 		let mut linehistory:Vec<Vec<u8>> = Vec::new(); // the history of text entered at the console, for up-arrow message repeating
 		let mut historypos:usize = 0; // the scroll position of the history list, for up-arrow message repeating
 		let mut linepos:usize = 0; // the position of the cursor in the console line
-		// ncurses machinery (for the fancy console display stuff)
-		let window = initscr();
-		let prompt:&str = "[teamech]-> ";
-		window.refresh(); // must be called every time the screen is to be updated.
-		window.keypad(true); // keypad mode, which is typical 
-		window.nodelay(true); // nodelay mode, which ensures that the window is actually updated on time
-		noecho(); // prevent local echo, since we'll be handling that ourselves
-		window.mv(window.get_max_y()-1,0); // go to the bottom left corner
-		window.refresh();
 		'authtry:loop {
-			window.mv(window.get_cur_y(),0);
-			window.clrtoeol();
-			window.addstr(&format!("Trying to contact server..."));
-			window.mv(0,0);
-			window.insdelln(-1);
-			window.mv(window.get_max_y()-1,0);
-			window.clrtoeol();
-			window.addstr(&prompt);
-			window.refresh();
+			windowlog(&window,&logfile,&format!("Trying to contact server..."));
 			match sendbytes(&listener,&serverhost,&vec![],&padpath) {
 				Err(why) => {
-					window.mv(window.get_cur_y(),0);
-					window.clrtoeol();
-					window.addstr(&format!("Could not send authentication payload - {}",why.description()));
-					window.mv(0,0);
-					window.insdelln(-1);
-					window.mv(window.get_max_y()-1,0);
-					window.clrtoeol();
-					window.refresh();
+					windowlog(&window,&logfile,&format!("Could not send authentication payload - {}",why.description()));
 					sleep(Duration::new(5,0));
 					continue 'authtry;
 				},
@@ -410,14 +501,7 @@ fn main() {
 					Err(why) => match why.kind() {
 						io::ErrorKind::WouldBlock => (),
 						_ => {
-							window.mv(window.get_cur_y(),0);
-							window.clrtoeol();
-							window.addstr(&format!("Could not receive authentication response - {}",why.description()));
-							window.mv(0,0);
-							window.insdelln(-1);
-							window.mv(window.get_max_y()-1,0);
-							window.clrtoeol();
-							window.refresh();
+							windowlog(&window,&logfile,&format!("Could not receive authentication response - {}",why.description()));
 							sleep(Duration::new(5,0));
 							continue 'authtry;
 						},
@@ -427,75 +511,31 @@ fn main() {
 						    match decrypt(&inbin[0..25].to_vec(),&padpath) {
 						        Ok(message) => match message[0] {
 						            0x02 => {
-							            window.mv(window.get_cur_y(),0);
-							            window.clrtoeol();
-							            window.addstr(&format!("Subscribed to server at {}.",serverhost));
-							            window.mv(0,0);
-							            window.insdelln(-1);
-							            window.mv(window.get_max_y()-1,0);
-							            window.clrtoeol();
-							            window.addstr(&prompt);
-							            window.refresh();
+							            windowlog(&window,&logfile,&format!("Subscribed to server at {}.",serverhost));
 							            break 'authtry;
 							        },
 							        0x19 => {
-							            window.mv(window.get_cur_y(),0);
-							            window.clrtoeol();
-							            window.addstr(&format!("Pad file is correct, but subscription rejected by server. Server may be full."));
-							            window.mv(0,0);
-							            window.insdelln(-1);
-							            window.mv(window.get_max_y()-1,0);
-							            window.clrtoeol();
-							            window.refresh();
+							            windowlog(&window,&logfile,&format!("Pad file is correct, but subscription rejected by server. Server may be full."));
 							            sleep(Duration::new(5,0));
 							        },
 							        other => {
-							            window.mv(window.get_cur_y(),0);
-							            window.clrtoeol();
-							            window.addstr(&format!("Server at {} sent an unknown status code {}. Is this the latest client version?",
+							            windowlog(&window,&logfile,&format!("Server at {} sent an unknown status code {}. Are these versions compatible?",
 							                                                                                                serverhost,other));
-							            window.mv(0,0);
-							            window.insdelln(-1);
-							            window.mv(window.get_max_y()-1,0);
-							            window.clrtoeol();
-							            window.refresh();
 							            sleep(Duration::new(5,0));
 							        },
 							    }, // decrypt Ok
 							    Err(why) => match why.kind() {
 							        io::ErrorKind::InvalidData => {
-							            window.mv(window.get_cur_y(),0);
-							            window.clrtoeol();
-							            window.addstr(&format!("Response from server did not validate. Local pad file is incorrect or invalid."));
-							            window.mv(0,0);
-							            window.insdelln(-1);
-							            window.mv(window.get_max_y()-1,0);
-							            window.clrtoeol();
-							            window.refresh();
-							            sleep(Duration::new(5,0));
+							            windowlog(&window,&logfile,&format!("Response from server did not validate. Local pad file is incorrect or invalid."));
 							        }
 							        _ => {
-							            window.mv(window.get_cur_y(),0);
-							            window.clrtoeol();
-							            window.addstr(&format!("Failed to decrypt response from server - {}",why.description()));
-							            window.mv(0,0);
-							            window.insdelln(-1);
-							            window.mv(window.get_max_y()-1,0);
-							            window.clrtoeol();
-							            window.refresh();
+							            windowlog(&window,&logfile,&format!("Failed to decrypt response from server - {}",why.description()));
 							            sleep(Duration::new(5,0));
 							        },
 							    }, // match why.kind
                             }; // match inbin[0]
                         } else { // if nrecv == 1
-							window.mv(window.get_cur_y(),0);
-							window.clrtoeol();
-							window.addstr(&format!("Got invalid message of length {} from {}.",nrecv,srcaddr));
-							window.mv(0,0);
-							window.insdelln(-1);
-							window.mv(window.get_max_y()-1,0);
-							window.clrtoeol();
-							window.refresh();
+							windowlog(&window,&logfile,&format!("Got invalid message of length {} from {}.",nrecv,srcaddr));
 							sleep(Duration::new(5,0));
                         }
 					}, // recv Ok
@@ -512,15 +552,7 @@ fn main() {
 						io::ErrorKind::WouldBlock => break 'receiver,
 						_ => {
 							// Receive error
-							window.mv(window.get_cur_y(),0);
-							window.clrtoeol();
-							window.addstr(&format!("Could not receive packet: {}. Trying again in 5 seconds...",why.description()));
-							window.mv(0,0);
-							window.insdelln(-1);
-							window.mv(window.get_max_y()-1,0);
-							window.clrtoeol();
-							window.addstr(&prompt);
-							window.refresh();
+							windowlog(&window,&logfile,&format!("Could not receive packet: {}. Trying again in 5 seconds...",why.description()));
 							sleep(Duration::new(5,0));
 						},
 					},
@@ -549,30 +581,14 @@ fn main() {
 								Err(why) => match why.kind() {
 									io::ErrorKind::InvalidData => {
 										// Validation failed
-										window.mv(window.get_cur_y(),0);
-										window.clrtoeol();
-										window.addstr("Warning: Message failed to validate. Pad file may be incorrect.");
-										window.mv(0,0);
-										window.insdelln(-1);
-										window.mv(window.get_max_y()-1,0);
-										window.clrtoeol();
-										window.addstr(&prompt);
-										window.refresh();
+										windowlog(&window,&logfile,"Warning: Message failed to validate. Pad file may be incorrect.");
 										let _ = sendbytes(&listener,&srcaddr,&vec![0x15],&padpath);
 										sleep(Duration::new(2,0));
 										break 'operator;
 									},
 									_ => {
 										// Other decryption error.
-										window.mv(window.get_cur_y(),0);
-										window.clrtoeol();
-										window.addstr(&format!("Decrypting of message failed - {}.",why.description()));
-										window.mv(0,0);
-										window.insdelln(-1);
-										window.mv(window.get_max_y()-1,0);
-										window.clrtoeol();
-										window.addstr(&prompt);
-										window.refresh();
+										windowlog(&window,&logfile,&format!("Decrypting of message failed - {}.",why.description()));
 										let _ = sendbytes(&listener,&srcaddr,&vec![0x1A],&padpath);
 									},
 								},
@@ -586,11 +602,11 @@ fn main() {
 									let mut messagetext:String = String::from_utf8_lossy(&messagechars).to_string();
 									let mut timestamp:[u8;8] = [0;8];
 									timestamp.copy_from_slice(&message[message.len()-8..message.len()]);
-									let msgtime:u64 = bytes2int(&timestamp);
+									let msgtime:i64 = bytes_i64(&timestamp);
 									let mut msgstatus:String = String::new();
-									if msgtime + MSG_VALID_TIME < systime() {
+									if msgtime + MSG_VALID_TIME < Local::now().timestamp_millis() {
 										msgstatus = format!(" [OUTDATED]");
-									} else if msgtime - MSG_VALID_TIME > systime() {
+									} else if msgtime - MSG_VALID_TIME > Local::now().timestamp_millis() {
 										msgstatus = format!(" [FUTURE]");
 						            }
 						            if nrecv == 25 && &msgstatus == "" {
@@ -599,43 +615,29 @@ fn main() {
 								            // Display response codes from the server on the right-hand side of
 								            // the terminal, on the same line as the outgoing message the
 								            // response corresponds to.
+								            // This is a special case, NOT something that should be
+								            // replaced with a simple call to windowlog().
 								            window.mv(window.get_cur_y()-1,window.get_max_x()-4);
 								            window.clrtoeol();
 								            window.addstr(format!("0x{}",&bytes2hex(&vec![message[0]])));
 								            window.mv(window.get_cur_y()+1,0);
 								            window.clrtoeol();
-								            window.addstr(&prompt);
+								            window.addstr(&PROMPT);
 								            window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
 								            window.refresh();
 							            }
 							            if inbin[0] == 0x19 { // END OF MEDIUM
 								            // Handle deauthentications
-								            window.mv(window.get_cur_y(),0);
-								            window.clrtoeol();
-								            window.addstr(&format!("Subscription expiration notification received - renewing subscription to {}",serverhost));
-								            window.mv(0,0);
-								            window.insdelln(-1);
-								            window.mv(window.get_max_y()-1,0);
-								            window.clrtoeol();
-								            window.addstr(&prompt);
-								            window.refresh();
+								            windowlog(&window,&logfile,&format!("Subscription expiration notification received - renewing subscription to {}",
+																																		serverhost));
 								            continue 'recovery;
 							            }
 						            } else {
-									    window.mv(window.get_max_y()-1,0);
-									    window.clrtoeol();
 									    if switches.contains("--showhex") || flags.contains(&'h') {
-									        window.addstr(&format!("\r[REM]{}: {} [{}]",msgstatus,messagetext,bytes2hex(&messagechars)));
+									        windowlog(&window,&logfile,&format!("[REM]{}: {} [{}]",msgstatus,messagetext,bytes2hex(&messagechars)));
 									    } else {
-									        window.addstr(&format!("\r[REM]{}: {}",msgstatus,messagetext));
+									        windowlog(&window,&logfile,&format!("[REM]{}: {}",msgstatus,messagetext));
 									    }
-									    window.mv(0,0);
-									    window.insdelln(-1);
-									    window.mv(window.get_max_y()-1,0);
-									    window.clrtoeol();
-									    window.addstr(&prompt);
-									    window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
-									    window.refresh();
 									    let _ = sendbytes(&listener,&srcaddr,&vec![0x06],&padpath);
 									}
 								},
@@ -651,19 +653,11 @@ fn main() {
 					0x0A => { // ENTER
 						// This means "send the message", so we start by printing it to the screen
 						// above the input line.
-						window.mv(window.get_cur_y(),0);
-						window.clrtoeol();
 						if switches.contains("--showhex") || flags.contains(&'h') {
-						    window.addstr(&format!("\r[LOC]: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
+						    windowlog(&window,&logfile,&format!("[LOC]: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
 						} else {
-						    window.addstr(&format!("\r[LOC]: {}",String::from_utf8_lossy(&consoleline)));
+						    windowlog(&window,&logfile,&format!("[LOC]: {}",String::from_utf8_lossy(&consoleline)));
 						}
-						window.mv(0,0);
-						window.insdelln(-1);
-						window.mv(window.get_max_y()-1,0);
-						window.clrtoeol();
-						window.addstr(&prompt);
-						window.refresh();
 						historypos = 0;
 						if linehistory.len() == 0 || linehistory[linehistory.len()-1] != consoleline {
 							// Append this line to the history, provided the last message sent
@@ -673,15 +667,7 @@ fn main() {
 						// Send (and encrypt) the message.
 						match sendbytes(&listener,&serverhost,&consoleline,&padpath) {
 							Err(why) => {
-								window.mv(window.get_cur_y(),0);
-								window.clrtoeol();
-								window.addstr(&format!("Encrypting message failed - {}",why.description()));
-								window.mv(0,0);
-								window.insdelln(-1);
-								window.mv(window.get_max_y()-1,0);
-								window.clrtoeol();
-								window.addstr(&prompt);
-								window.refresh();
+								windowlog(&window,&logfile,&format!("Encrypting message failed - {}",why.description()));
 								continue 'operator;
 							},
 						    Ok(_) => (),
@@ -732,7 +718,7 @@ fn main() {
 						consoleline = linehistory[linehistory.len()-historypos].to_vec();
 						window.mv(window.get_cur_y(),0);
 						window.clrtoeol();
-						window.addstr(&prompt);
+						window.addstr(&PROMPT);
 						window.addstr(&String::from_utf8_lossy(&consoleline));
 						linepos = consoleline.len();
 						window.refresh();
@@ -754,7 +740,7 @@ fn main() {
 					}
 					window.mv(window.get_cur_y(),0);
 					window.clrtoeol();
-					window.addstr(&prompt);
+					window.addstr(&PROMPT);
 					window.addstr(&String::from_utf8_lossy(&consoleline));
 					linepos = consoleline.len();
 					window.refresh();
@@ -782,15 +768,15 @@ fn main() {
 				},
 				Some(Input::KeyHome) => {
 					// home and end are also straightforward and don't do anything uncommon.
-					window.mv(window.get_cur_y(),prompt.len() as i32); // for some reason ncurses positions have to be i32 instead of usize? :eyeroll:
+					window.mv(window.get_cur_y(),PROMPT.len() as i32); // for some reason ncurses positions have to be i32 instead of usize? :eyeroll:
 					linepos = 0;
 					window.refresh();
 				},
 				Some(Input::KeyEnd) => {
-					if prompt.len()+linepos >= window.get_max_x() as usize {
+					if PROMPT.len()+linepos >= window.get_max_x() as usize {
 						window.mv(window.get_cur_y(),window.get_max_x()-1);
 					} else {
-						window.mv(window.get_cur_y(),(prompt.len()+consoleline.len()) as i32);
+						window.mv(window.get_cur_y(),(PROMPT.len()+consoleline.len()) as i32);
 					}
 					linepos = consoleline.len();
 					window.refresh();

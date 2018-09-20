@@ -1,4 +1,4 @@
-/* Teamech Desktop Client v0.4
+/* Teamech Desktop Client v0.5
  * September 2018
  * License: AGPL v3.0
  *
@@ -34,7 +34,7 @@
 Cargo.toml:
 [package]
 name = "teamech-console"
-version = "0.3.0"
+version = "0.5.0"
 authors = ["ellie"]
 
 [dependencies]
@@ -68,7 +68,9 @@ use chrono::prelude::*;
 extern crate byteorder;
 use byteorder::{LittleEndian,ReadBytesExt,WriteBytesExt};
 
-use std::env::args;
+#[macro_use]
+extern crate clap;
+
 use std::time::Duration;
 use std::process;
 use std::thread::sleep;
@@ -76,7 +78,6 @@ use std::error::Error;
 use std::io;
 use std::io::prelude::*;
 use std::net::{UdpSocket,SocketAddr,ToSocketAddrs};
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path,PathBuf};
 
@@ -387,53 +388,50 @@ fn sendbytes(listener:&UdpSocket,destaddr:&SocketAddr,bytes:&Vec<u8>,padpath:&Pa
 }
 
 fn main() {
-	if args().count() < 3 || args().count() > 4 {
-		// If the user provides the wrong number of arguments, remind them of how to use this program.
-		println!("Usage: teamech-console [host:remoteport] [localport] [keyfile]");
-		process::exit(1);
-	}
-	let mut argv:Vec<String> = Vec::new();
-	let mut flags:HashSet<char> = HashSet::new();
-	let mut switches:HashSet<String> = HashSet::new();
-    for arg in args() {
-        // bin arguments into -flags, --switches, and positional arguments.
-        if arg.starts_with("--") {
-            let _ = switches.insert(arg);
-        } else if arg.starts_with("-") {
-            for c in arg.as_bytes()[1..arg.len()].iter() {
-                let _ = flags.insert(*c as char);
-            }
-        } else {
-            argv.push(arg);
-        }
-    }
-	let mut port:u16 = 0;
-	let mut padpath:&Path = Path::new("");
-	// If a port number was specified (3 arguments), try to parse it and use it. If the second
-	// argument of three was not a valid port number, or there were only three arguments
-	// provided, then we will pass 0 to the OS as the port number, which tells it to
-	// automatically allocate a free UDP port. Unlike for the server, this is a perfectly
-	// reasonable thing to do for the client.
-	if argv.len() == 4 {
-		padpath = Path::new(&argv[3]);
-		if let Ok(n) = argv[2].parse::<u16>() {
-			port = n;
-		} else {
-			println!("Warning: Argument #2 failed to parse as a valid port number. Passing port 0 (auto-allocate) to the OS instead.");
-		}
-	} else if argv.len() == 3 {
-		padpath = Path::new(&argv[2]);
-	}
-	let serverhosts:Vec<SocketAddr> = match argv[1].to_socket_addrs() {
+	let arguments = clap_app!(app =>
+		(version: "0.5")
+		(author: "Ellie D.")
+		(about: "Desktop console client for the Teamech protocol.")
+		(@arg ADDRESS: +required "Remote address to contact.")
+		(@arg PADFILE: +required "Pad file to use for encryption/decryption (must be same as server's).")
+		(@arg name: -n --name +takes_value "Unique identifier to present to the server for routing.")
+		(@arg class: -c --class +takes_value "Non-unique identifier to present to the server for routing.")
+		(@arg localport: -p --localport +takes_value "UDP port to bind to locally (automatic if unset).")
+		(@arg showhex: -h --showhex "Show hexadecimal values of messages (useful if working with binary messages).")
+	).get_matches();
+	let port:u16 = match arguments.value_of("localport").unwrap_or("0").parse::<u16>() {
 		Err(_) => {
-			// Failure to parse a remote address is always a fatal error - if this doesn't work, we
-			// have nothing to do.
-			println!("Could not parse argument #1 as an IP address or hostname.");
+			println!("Warning: Could not parse specified local port number as a 16-bit integer. Using auto-selection instead.");
+			0
+		},
+		Ok(n) => n,
+	};
+	let serverhosts:Vec<SocketAddr> = match arguments.value_of("ADDRESS") {
+		None => {
+			println!("Usage: teamech-desktop [address:port] [padfile]");
 			process::exit(1);
 		},
-		Ok(addrs) => addrs.collect(),
+		Some(value) => match value.to_socket_addrs() {
+			Err(_) => {
+				// Failure to parse a remote address is always a fatal error - if this doesn't work, we
+				// have nothing to do.
+				println!("Could not parse argument #1 as an IP address or hostname.");
+				process::exit(1);
+			},
+			Ok(addrs) => addrs.collect(),
+		},
 	};
 	let serverhost:SocketAddr = serverhosts[0];
+	let padfilename:&str = match arguments.value_of("PADFILE") {
+		None => {
+			println!("Usage: teamech-desktop [address:port] [padfile]");
+			process::exit(1);
+		},
+		Some(filename) => filename,
+	};
+	let padpath:&Path = Path::new(&padfilename);
+	let clientname:&str = arguments.value_of("name").unwrap_or("human");
+	let clientclass:&str = arguments.value_of("class").unwrap_or("console");
 	'recovery:loop {
 		// Recovery and operator loop structure is similar to that used in the server; the operator
 		// loop runs constantly while the program is active, while the recovery loop catches breaks
@@ -512,6 +510,12 @@ fn main() {
 						        Ok(message) => match message[0] {
 						            0x02 => {
 							            windowlog(&window,&logfile,&format!("Subscribed to server at {}.",serverhost));
+										let mut namemsg:Vec<u8> = vec![0x01];
+										let mut classmsg:Vec<u8> = vec![0x11];
+										namemsg.append(&mut clientname.as_bytes().to_vec());
+										classmsg.append(&mut clientclass.as_bytes().to_vec());
+										let _ = sendbytes(&listener,&serverhost,&namemsg,&padpath);
+										let _ = sendbytes(&listener,&serverhost,&classmsg,&padpath);
 							            break 'authtry;
 							        },
 							        0x19 => {
@@ -626,14 +630,24 @@ fn main() {
 								            window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
 								            window.refresh();
 							            }
-							            if inbin[0] == 0x19 { // END OF MEDIUM
+							            if message[0] == 0x19 { // END OF MEDIUM
 								            // Handle deauthentications
 								            windowlog(&window,&logfile,&format!("Subscription expiration notification received - renewing subscription to {}",
 																																		serverhost));
 								            continue 'recovery;
 							            }
+							            if message[0] == 0x02 {
+							            	// Handle requests for identification
+								            windowlog(&window,&logfile,&format!("Sending identification to {}",serverhost));
+											let mut namemsg:Vec<u8> = vec![0x01];
+											let mut classmsg:Vec<u8> = vec![0x11];
+											namemsg.append(&mut clientname.as_bytes().to_vec());
+											classmsg.append(&mut clientclass.as_bytes().to_vec());
+											let _ = sendbytes(&listener,&serverhost,&namemsg,&padpath);
+											let _ = sendbytes(&listener,&serverhost,&classmsg,&padpath);
+							            }
 						            } else {
-									    if switches.contains("--showhex") || flags.contains(&'h') {
+									    if arguments.is_present("showhex") {
 									        windowlog(&window,&logfile,&format!("[REM]{}: {} [{}]",msgstatus,messagetext,bytes2hex(&messagechars)));
 									    } else {
 									        windowlog(&window,&logfile,&format!("[REM]{}: {}",msgstatus,messagetext));
@@ -653,7 +667,7 @@ fn main() {
 					0x0A => { // ENTER
 						// This means "send the message", so we start by printing it to the screen
 						// above the input line.
-						if switches.contains("--showhex") || flags.contains(&'h') {
+						if arguments.is_present("showhex") {
 						    windowlog(&window,&logfile,&format!("[LOC]: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
 						} else {
 						    windowlog(&window,&logfile,&format!("[LOC]: {}",String::from_utf8_lossy(&consoleline)));

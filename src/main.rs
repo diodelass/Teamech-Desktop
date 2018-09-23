@@ -26,9 +26,9 @@
  * COMMAND-LINE FLAGS
  *
  * --showhex / -h 
- *      Prints the hex values of all sent and received characters after the lossy-utf8 string
- *      version in the console. Useful if dealing in messages which are binary and not
- *      human-readable.
+ *	  Prints the hex values of all sent and received characters after the lossy-utf8 string
+ *	  version in the console. Useful if dealing in messages which are binary and not
+ *	  human-readable.
  *
 
 Cargo.toml:
@@ -165,7 +165,7 @@ fn windowlog(window:&Window,logfile:&Path,line:&str) {
 	log(&window,&logfile,&line);
 	window.mv(window.get_cur_y(),0);
 	window.clrtoeol();
-	window.addstr(&line);
+	window.addstr(&format!("[{}] {}",Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),&line));
 	window.mv(0,0);
 	window.insdelln(-1);
 	window.mv(window.get_max_y()-1,0);
@@ -404,7 +404,7 @@ fn main() {
 	};
 	let padpath:&Path = Path::new(&padfilename);
 	let clientname:&str = arguments.value_of("name").unwrap_or("human");
-	let clientclass:&str = arguments.value_of("class").unwrap_or("console");
+	let clientclass:&str = arguments.value_of("class").unwrap_or("supervisor");
 	'recovery:loop {
 		// Recovery and operator loop structure is similar to that used in the server; the operator
 		// loop runs constantly while the program is active, while the recovery loop catches breaks
@@ -424,7 +424,8 @@ fn main() {
 		windowprint(&window,"");
 		let logfilename:String = format!("{}-teamech-desktop.log",Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
 		let logfile:&Path = Path::new(&logfilename);
-		windowprint(&window,&format!("- Using log file {} in {}.",&logfilename,&LOG_DIRECTORY));
+		windowprint(&window,&format!("Using log file {} in {}.",&logfilename,&LOG_DIRECTORY));
+		windowprint(&window,"");
 		match logtofile(&logfile,&format!("Opened log file."),Local::now()) {
 			Err(why) => {
 				windowprint(&window,&format!("-!- WARNING: Could not open log file at {} - {}. Logs are currently NOT BEING SAVED - you should fix this!",
@@ -506,38 +507,38 @@ fn main() {
 						},
 					},
 					Ok((nrecv,srcaddr)) => {
-					    if nrecv == 25 && srcaddr == serverhost {
-						    let (datavalid,message):(bool,Vec<u8>) = decrypt(&inbin[0..25].to_vec(),&pad);
-						    if datavalid {
-						        match message[0] {
-						            0x02 => {
-							            windowlog(&window,&logfile,&format!("- Subscribed to server at {}.",serverhost));
+						if nrecv == 25 && srcaddr == serverhost {
+							let (datavalid,message):(bool,Vec<u8>) = decrypt(&inbin[0..25].to_vec(),&pad);
+							if datavalid {
+								match message[0] {
+									0x02 => {
+										windowlog(&window,&logfile,&format!("- Subscribed to server at {}.",serverhost));
 										let mut namemsg:Vec<u8> = vec![0x01];
 										let mut classmsg:Vec<u8> = vec![0x11];
 										namemsg.append(&mut clientname.as_bytes().to_vec());
 										classmsg.append(&mut clientclass.as_bytes().to_vec());
 										let _ = sendbytes(&listener,&serverhost,&namemsg,&pad);
 										let _ = sendbytes(&listener,&serverhost,&classmsg,&pad);
-							            break 'authtry;
-							        },
-							        0x19 => {
-							            windowlog(&window,&logfile,
+										break 'authtry;
+									},
+									0x19 => {
+										windowlog(&window,&logfile,
 														&format!("-!- Pad file is correct, but subscription rejected by server. Server may be full."));
-							            sleep(Duration::new(5,0));
-							        },
-							        other => {
-							            windowlog(&window,&logfile,&format!("-!- Server at {} sent an unknown status code {}. Are these versions compatible?",
-							                                                                                                serverhost,other));
-							            sleep(Duration::new(5,0));
-							        },
-							    };
+										sleep(Duration::new(5,0));
+									},
+									other => {
+										windowlog(&window,&logfile,&format!("-!- Server at {} sent an unknown status code {}. Are these versions compatible?",
+																															serverhost,other));
+										sleep(Duration::new(5,0));
+									},
+								};
 							} else {
 								windowlog(&window,&logfile,&format!("-!- Response from server did not validate. Local pad file is incorrect or invalid."));
 							}
-                        } else {
+						} else {
 							windowlog(&window,&logfile,&format!("-!- Got invalid message of length {} from {}.",nrecv,srcaddr));
 							sleep(Duration::new(5,0));
-                        }
+						}
 					}, // recv Ok
 				}; // match recv
 			} // for 0..10
@@ -605,33 +606,17 @@ fn main() {
 								msgstatus = format!(" [OUTDATED]");
 							} else if msgtime - MSG_VALID_TIME > Local::now().timestamp_millis() {
 								msgstatus = format!(" [FUTURE]");
-						    }
-						    if nrecv == 25 && &msgstatus == "" {
-							    // payloads of one byte are messages from the server.
-							    if window.get_cur_y() > 0 {
-								    // Display response codes from the server on the right-hand side of
-								    // the terminal, on the same line as the outgoing message the
-								    // response corresponds to.
-								    // This is a special case, NOT something that should be
-								    // replaced with a simple call to windowlog().
-								    window.mv(window.get_cur_y()-1,window.get_max_x()-4);
-								    window.clrtoeol();
-								    window.addstr(format!("0x{}",&bytes2hex(&vec![message[0]])));
-								    window.mv(window.get_cur_y()+1,0);
-								    window.clrtoeol();
-								    window.addstr(&PROMPT);
-								    window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
-								    window.refresh();
-							    }
-							    if message[0] == 0x19 { // END OF MEDIUM
-								    // Handle deauthentications
-								    windowlog(&window,&logfile,&format!("- Subscription expiration notification received - renewing subscription to {}...",
+							}
+							match (msgstatus.as_ref(),message[0],messagebytes.len()) {
+								("",0x19,1) => { // END OF MEDIUM
+									// Handle deauthentications
+									windowlog(&window,&logfile,&format!("- Subscription expiration notification received - renewing subscription to {}...",
 																																serverhost));
-								    continue 'recovery;
-							    }
-							    if message[0] == 0x02 {
-							        // Handle requests for identification
-								    windowlog(&window,&logfile,&format!("- Subscribed to server at {}.",serverhost));
+									continue 'recovery;
+								},
+								("",0x02,1) => {
+									// Handle requests for identification
+									windowlog(&window,&logfile,&format!("- Subscribed to server at {}.",serverhost));
 									let mut namemsg:Vec<u8> = vec![0x01];
 									let mut classmsg:Vec<u8> = vec![0x11];
 									namemsg.append(&mut clientname.as_bytes().to_vec());
@@ -641,20 +626,45 @@ fn main() {
 									if ackbuffer.len() > 0 {
 										let _ = sendbytes(&listener,&srcaddr,&ackbuffer[0],&pad);
 									}
-							    }
-							    if message[0] == 0x06 {
-							        if ackbuffer.len() > 0 {
+								},
+								("",0x06,1) => (),
+								("",0x06,3) => {
+									if ackbuffer.len() > 0 {
 										ackbuffer.remove(0);
-							        }
-							    }
-						    } else {
-								if arguments.is_present("showhex") {
-									windowlog(&window,&logfile,&format!("[{}]{}: {} [{}]",messagesender,msgstatus,messagecontents,bytes2hex(&messagechars)));
-								} else {
-									windowlog(&window,&logfile,&format!("[{}]{}: {}",messagesender,msgstatus,messagecontents));
-								}
-								let _ = sendbytes(&listener,&srcaddr,&vec![0x06],&pad);
-							}
+									}
+									let mut nsends:u16 = 0;
+									nsends += message[2] as u16;
+									nsends += (message[1] as u16) << 8;
+									let nsendstr:&str = &format!("[ {} ]",&nsends.to_string());
+									if window.get_cur_y() > 0 {
+										// Display response codes from the server on the right-hand side of
+										// the terminal, on the same line as the outgoing message the
+										// response corresponds to.
+										// This is a special case, NOT something that should be
+										// replaced with a simple call to windowlog().
+										window.mv(window.get_cur_y()-1,window.get_max_x()-(nsendstr.len() as i32));
+										window.clrtoeol();
+										window.addstr(format!("{}",&nsendstr));
+										window.mv(window.get_cur_y()+1,0);
+										window.clrtoeol();
+										window.addstr(&PROMPT);
+										window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
+										window.refresh();
+									}
+								},
+								("",0x05,_) => {
+									windowlog(&window,&logfile,&format!("- {}",&String::from_utf8_lossy(&message[1..message.len()-8])));
+								},
+								(status,_,n) => {
+									if arguments.is_present("showhex") {
+										windowlog(&window,&logfile,&format!("<{}>{}: {} [{}] [{}]",
+												messagesender,status,messagecontents,bytes2hex(&messagechars),n));
+									} else {
+										windowlog(&window,&logfile,&format!("<{}>{}: {}",messagesender,status,messagecontents));
+									}
+									let _ = sendbytes(&listener,&srcaddr,&vec![0x06],&pad);
+								},
+							};
 						} // if nrecv > 24
 					}, // recv ok
 				}; // match recvfrom
@@ -667,9 +677,9 @@ fn main() {
 						// This means "send the message", so we start by printing it to the screen
 						// above the input line.
 						if arguments.is_present("showhex") {
-						    windowlog(&window,&logfile,&format!("[local]: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
+							windowlog(&window,&logfile,&format!("<local>: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
 						} else {
-						    windowlog(&window,&logfile,&format!("[local]: {}",String::from_utf8_lossy(&consoleline)));
+							windowlog(&window,&logfile,&format!("<local>: {}",String::from_utf8_lossy(&consoleline)));
 						}
 						historypos = 0;
 						if linehistory.len() == 0 || linehistory[linehistory.len()-1] != consoleline {
@@ -683,7 +693,7 @@ fn main() {
 								windowlog(&window,&logfile,&format!("-!- Sending message failed - {}",why.description()));
 								continue 'operator;
 							},
-						    Ok(_) => (),
+							Ok(_) => (),
 						};
 						ackbuffer.push(consoleline.clone());
 						consoleline = Vec::new();

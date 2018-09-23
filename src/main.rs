@@ -1,4 +1,4 @@
-/* Teamech Desktop Client v0.5
+/* Teamech Desktop Client v0.6
  * September 2018
  * License: AGPL v3.0
  *
@@ -34,7 +34,7 @@
 Cargo.toml:
 [package]
 name = "teamech-console"
-version = "0.5.0"
+version = "0.6.0"
 authors = ["ellie"]
 
 [dependencies]
@@ -47,9 +47,10 @@ byteorder = "1"
 
  */
 
+static VERSION:&str = "0.6 September 2018";
 static MSG_VALID_TIME:i64 = 10_000; // Tolerance interval in ms for packet timestamps outside of which to mark them as suspicious
 static LOG_DIRECTORY:&str = ".teamech-logs/desktop";
-static PROMPT:&str = "[teamech]-> ";
+static PROMPT:&str = "[teamech]: ";
 
 extern crate rand;
 
@@ -71,6 +72,7 @@ use byteorder::{LittleEndian,ReadBytesExt,WriteBytesExt};
 #[macro_use]
 extern crate clap;
 
+use std::env::set_var;
 use std::time::Duration;
 use std::process;
 use std::thread::sleep;
@@ -79,6 +81,7 @@ use std::io;
 use std::io::prelude::*;
 use std::net::{UdpSocket,SocketAddr,ToSocketAddrs};
 use std::fs;
+use std::fs::File;
 use std::path::{Path,PathBuf};
 
 fn i64_bytes(number:&i64) -> [u8;8] {
@@ -188,7 +191,7 @@ fn logtofile(logfilename:&Path,logstring:&str,timestamp:DateTime<Local>) -> Resu
 										.open(&logpath) {
 		Ok(file) => file,
 		Err(why) => match why.kind() {
-			io::ErrorKind::NotFound => match fs::File::create(&logpath) {
+			io::ErrorKind::NotFound => match File::create(&logpath) {
 				Ok(file) => file,
 				Err(why) => return Err(why),
 			},
@@ -214,22 +217,12 @@ fn log(window:&Window,logfilename:&Path,logstring:&str) {
 	};
 }
 
-// Teacrypt implementation: Generate single-use key and secret seed.
 // Generates a single-use encryption key from a provided key size, pad file and authentication 
 // nonce, and returns the key and its associated secret seed.
-fn keygen(nonce:&[u8;8],padpath:&Path,keysize:&usize) -> Result<(Vec<u8>,Vec<u8>),io::Error> {
-	let mut padfile:fs::File = match fs::File::open(&padpath) {
-		Err(e) => return Err(e),
-		Ok(file) => file,
-	};
+fn keygen(nonce:&[u8;8],pad:&Vec<u8>,keysize:&usize) -> (Vec<u8>,Vec<u8>) {
 	// Finding the pad size this way won't work if the pad is a block device instead of a regular
 	// file. If using the otherwise-valid strategy of using a filesystemless flash device as a pad,
 	// this block will need to be extended to use a different method of detecting the pad size.
-	let padsize:u64 = match fs::metadata(&padpath) {
-		Err(e) => return Err(e),
-		Ok(metadata) => metadata.len(),
-	};
-	let mut inbin:[u8;1] = [0];
 	let mut seed:[u8;8] = [0;8];
 	let mut seednonce:[u8;8] = nonce.clone();
 	let mut newseednonce:[u8;8] = [0;8];
@@ -247,9 +240,7 @@ fn keygen(nonce:&[u8;8],padpath:&Path,keysize:&usize) -> Result<(Vec<u8>,Vec<u8>
 		}
 		sha3.finalize(&mut newseednonce);
 		seednonce = newseednonce;
-		let _ = padfile.seek(io::SeekFrom::Start(bytes_u64(&seednonce) % padsize));
-		let _ = padfile.read_exact(&mut inbin);
-		seed[x] = inbin[0];
+		seed[x] = pad[bytes_u64(&seednonce) as usize%pad.len()];
 	}
 	let mut keybytes:Vec<u8> = Vec::with_capacity(*keysize);
 	let mut keynonce:[u8;8] = seed;
@@ -266,27 +257,21 @@ fn keygen(nonce:&[u8;8],padpath:&Path,keysize:&usize) -> Result<(Vec<u8>,Vec<u8>
 		}
 		sha3.finalize(&mut newkeynonce);
 		keynonce = newkeynonce;
-		let _ = padfile.seek(io::SeekFrom::Start(bytes_u64(&keynonce) % padsize));
-		let _ = padfile.read_exact(&mut inbin);
-		keybytes.push(inbin[0]);
+		keybytes.push(pad[bytes_u64(&keynonce) as usize%pad.len()]);
 	}
-	return Ok((keybytes,seed.to_vec()));
+	return (keybytes,seed.to_vec());
 }
 
-// Teacrypt implementation: Encrypt a message for transmission.
 // Depends on keygen function; generates a random nonce, produces a key, signs the message using
 // the secret seed, and returns the resulting encrypted payload (including the message,
 // signature, and nonce).
-fn encrypt(message:&Vec<u8>,padpath:&Path) -> Result<Vec<u8>,io::Error> {
+fn encrypt(message:&Vec<u8>,pad:&Vec<u8>) -> Vec<u8> {
 	let nonce:u64 = rand::random::<u64>();
 	let noncebytes:[u8;8] = u64_bytes(&nonce);
 	let keysize:usize = message.len()+8;
 	// Use the keygen function to create a key of length n + 8, where n is the length of the
 	// message to be encrypted. (The extra eight bytes are for encrypting the signature.)
-	let (keybytes,seed) = match keygen(&noncebytes,&padpath,&keysize) {
-		Ok((k,s)) => (k,s),
-		Err(e) => return Err(e),
-	};
+	let (keybytes,seed) = keygen(&noncebytes,&pad,&keysize);
 	let mut signature:[u8;8] = [0;8];
 	let mut sha3 = Keccak::new_sha3_256();
 	// Generate the signature by hashing the secret seed, the unencrypted message, and the key used
@@ -303,26 +288,22 @@ fn encrypt(message:&Vec<u8>,padpath:&Path) -> Result<Vec<u8>,io::Error> {
 		payload.push(verimessage[x] ^ keybytes[x]);
 	}
 	payload.append(&mut noncebytes.to_vec());
-	return Ok(payload);
+	return payload;
 }
 
-// Teacrypt implementation: Decrypt a received message.
 // Depends on keygen function; uses the nonce attached to the payload to generate the same key and
 // secret seed, decrypt the payload, and verify the resulting message with its signature. The
 // signature will only validate if the message was the original one encrypted with the same pad 
 // file as the one used to decrypt it; if it has been tampered with, generated with a different
 // pad, or is just random junk data, the validity check will fail and this function will return an
 // io::ErrorKind::InvalidData error.
-fn decrypt(payload:&Vec<u8>,padpath:&Path) -> Result<Vec<u8>,io::Error> {
+fn decrypt(payload:&Vec<u8>,pad:&Vec<u8>) -> (bool,Vec<u8>) {
 	let mut noncebytes:[u8;8] = [0;8];
 	// Detach the nonce from the payload, and use it to generate the key and secret seed.
 	noncebytes.copy_from_slice(&payload[payload.len()-8..payload.len()]);
 	let keysize = payload.len()-8;
 	let ciphertext:Vec<u8> = payload[0..payload.len()-8].to_vec();
-	let (keybytes,seed) = match keygen(&noncebytes,&padpath,&keysize) {
-		Ok((k,s)) => (k,s),
-		Err(e) => return Err(e),
-	};
+	let (keybytes,seed) = keygen(&noncebytes,&pad,&keysize);
 	let mut verimessage = Vec::new();
 	// Decrypt the message and signature using the key.
 	for x in 0..keysize {
@@ -334,17 +315,13 @@ fn decrypt(payload:&Vec<u8>,padpath:&Path) -> Result<Vec<u8>,io::Error> {
 	// return an io::ErrorKind::InvalidData error.
 	signature.copy_from_slice(&verimessage[verimessage.len()-8..verimessage.len()]);
 	let message:Vec<u8> = verimessage[0..verimessage.len()-8].to_vec();
-	let mut rightsum:[u8;8] = [0;8];
+	let mut truesig:[u8;8] = [0;8];
 	let mut sha3 = Keccak::new_sha3_256();
 	sha3.update(&seed);
 	sha3.update(&message);
 	sha3.update(&keybytes);
-	sha3.finalize(&mut rightsum);
-	if signature == rightsum {
-		return Ok(message);
-	} else {
-		return Err(io::Error::new(io::ErrorKind::InvalidData,"Payload signature verification failed"));
-	}
+	sha3.finalize(&mut truesig);
+	return (signature == truesig,message);
 }
 
 // Sends a vector of bytes to a specific host over a specific socket, automatically retrying in the event of certain errors
@@ -375,22 +352,17 @@ fn sendraw(listener:&UdpSocket,destaddr:&SocketAddr,payload:&Vec<u8>) -> Result<
 }
 
 // Automatically encrypts a vector of bytes and sends them over the socket.
-fn sendbytes(listener:&UdpSocket,destaddr:&SocketAddr,bytes:&Vec<u8>,padpath:&Path) -> Result<(),io::Error> {
-    let mut stampedbytes = bytes.clone();
-    stampedbytes.append(&mut i64_bytes(&Local::now().timestamp_millis()).to_vec());
-	let payload = match encrypt(&stampedbytes,&padpath) {
-	    Err(why) => {
-	        return Err(why);
-	    },
-	    Ok(b) => b,
-	};
+fn sendbytes(listener:&UdpSocket,destaddr:&SocketAddr,bytes:&Vec<u8>,pad:&Vec<u8>) -> Result<(),io::Error> {
+	let mut stampedbytes = bytes.clone();
+	stampedbytes.append(&mut i64_bytes(&Local::now().timestamp_millis()).to_vec());
+	let payload = encrypt(&stampedbytes,&pad); 
 	return sendraw(&listener,&destaddr,&payload);
 }
 
 fn main() {
 	let arguments = clap_app!(app =>
 		(name: "Teamech Console")
-		(version: "0.5 2018-09")
+		(version: VERSION)
 		(author: "Ellie D.")
 		(about: "Desktop console client for the Teamech protocol.")
 		(@arg ADDRESS: +required "Remote address to contact.")
@@ -438,6 +410,7 @@ fn main() {
 		// loop runs constantly while the program is active, while the recovery loop catches breaks
 		// from the operator and smoothly restarts the program in the event of a problem.
 		// ncurses machinery (for the fancy console display stuff)
+		set_var("ESCDELAY","0"); // force ESCDELAY to be 0, so we can quit the application with the ESC key without the default 1-second delay.
 		let window = initscr();
 		window.refresh(); // must be called every time the screen is to be updated.
 		window.keypad(true); // keypad mode, which is typical 
@@ -445,14 +418,38 @@ fn main() {
 		noecho(); // prevent local echo, since we'll be handling that ourselves
 		window.mv(window.get_max_y()-1,0); // go to the bottom left corner
 		window.refresh();
+		// Print welcome messages
+		windowprint(&window,&format!("Teamech Console {}",&VERSION));
+		windowprint(&window,"Press <Esc> to exit (or Ctrl-C to force exit).");
+		windowprint(&window,"");
 		let logfilename:String = format!("{}-teamech-desktop.log",Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
 		let logfile:&Path = Path::new(&logfilename);
-		match logtofile(&logfile,&format!("Opened log file"),Local::now()) {
+		windowprint(&window,&format!("- Using log file {} in {}.",&logfilename,&LOG_DIRECTORY));
+		match logtofile(&logfile,&format!("Opened log file."),Local::now()) {
 			Err(why) => {
-				windowprint(&window,&format!("WARNING: Could not open log file at {} - {}. Logs are currently NOT BEING SAVED - you should fix this!",
+				windowprint(&window,&format!("-!- WARNING: Could not open log file at {} - {}. Logs are currently NOT BEING SAVED - you should fix this!",
 																												logfile.display(),why.description()));
 			},
 			Ok(_) => (),
+		};
+		windowlog(&window,&logfile,&format!("- Loading key data from pad file at {}...",&padpath.display()));
+		let mut pad:Vec<u8> = Vec::new();
+		match File::open(&padpath) {
+			Err(why) => {
+				endwin();
+				println!("Could not open pad file at {} - {}.",&padpath.display(),&why.description());
+				process::exit(1);
+			},
+			Ok(mut padfile) => match padfile.read_to_end(&mut pad) {
+				Err(why) => {
+					endwin();
+					println!("Could not load key data from pad file at {} - {}.",&padpath.display(),&why.description());
+					process::exit(1);
+				},
+				Ok(_) => {
+					windowlog(&window,&logfile,"- Finished loading key data.");
+				},
+			},
 		};
 		let listener:UdpSocket = match UdpSocket::bind(&format!("0.0.0.0:{}",port)) {
 			Ok(socket) => socket,
@@ -462,7 +459,8 @@ fn main() {
 				// another program (or another instance of this one) occupying the port the user 
 				// specified. In any case, we can't continue, so we'll let the user know what the
 				// problem is and quit.
-				println!("Could not bind to local address: {}",why.description());
+				endwin();
+				println!("Could not bind to local address: {}.",why.description());
 				process::exit(1);
 			},
 		};
@@ -473,7 +471,8 @@ fn main() {
 				// but it probably means that the OS doesn't support nonblocking UDP sockets, which
 				// is weird and means this program won't really work. Hopefully, the error message
 				// will be useful to the user.
-				println!("Could not set socket to nonblocking mode: {}",why.description());
+				endwin();
+				println!("Could not set socket to nonblocking mode: {}.",why.description());
 				process::exit(1);
 			},
 		}
@@ -486,10 +485,10 @@ fn main() {
 		let mut historypos:usize = 0; // the scroll position of the history list, for up-arrow message repeating
 		let mut linepos:usize = 0; // the position of the cursor in the console line
 		'authtry:loop {
-			windowlog(&window,&logfile,&format!("Trying to contact server..."));
-			match sendbytes(&listener,&serverhost,&vec![],&padpath) {
+			windowlog(&window,&logfile,&format!("- Trying to contact server..."));
+			match sendbytes(&listener,&serverhost,&vec![],&pad) {
 				Err(why) => {
-					windowlog(&window,&logfile,&format!("Could not send authentication payload - {}",why.description()));
+					windowlog(&window,&logfile,&format!("-!- Could not send authentication payload - {}.",why.description()));
 					sleep(Duration::new(5,0));
 					continue 'authtry;
 				},
@@ -501,47 +500,42 @@ fn main() {
 					Err(why) => match why.kind() {
 						io::ErrorKind::WouldBlock => (),
 						_ => {
-							windowlog(&window,&logfile,&format!("Could not receive authentication response - {}",why.description()));
+							windowlog(&window,&logfile,&format!("-!- Could not receive authentication response - {}.",why.description()));
 							sleep(Duration::new(5,0));
 							continue 'authtry;
 						},
 					},
 					Ok((nrecv,srcaddr)) => {
 					    if nrecv == 25 && srcaddr == serverhost {
-						    match decrypt(&inbin[0..25].to_vec(),&padpath) {
-						        Ok(message) => match message[0] {
+						    let (datavalid,message):(bool,Vec<u8>) = decrypt(&inbin[0..25].to_vec(),&pad);
+						    if datavalid {
+						        match message[0] {
 						            0x02 => {
-							            windowlog(&window,&logfile,&format!("Subscribed to server at {}.",serverhost));
+							            windowlog(&window,&logfile,&format!("- Subscribed to server at {}.",serverhost));
 										let mut namemsg:Vec<u8> = vec![0x01];
 										let mut classmsg:Vec<u8> = vec![0x11];
 										namemsg.append(&mut clientname.as_bytes().to_vec());
 										classmsg.append(&mut clientclass.as_bytes().to_vec());
-										let _ = sendbytes(&listener,&serverhost,&namemsg,&padpath);
-										let _ = sendbytes(&listener,&serverhost,&classmsg,&padpath);
+										let _ = sendbytes(&listener,&serverhost,&namemsg,&pad);
+										let _ = sendbytes(&listener,&serverhost,&classmsg,&pad);
 							            break 'authtry;
 							        },
 							        0x19 => {
-							            windowlog(&window,&logfile,&format!("Pad file is correct, but subscription rejected by server. Server may be full."));
+							            windowlog(&window,&logfile,
+														&format!("-!- Pad file is correct, but subscription rejected by server. Server may be full."));
 							            sleep(Duration::new(5,0));
 							        },
 							        other => {
-							            windowlog(&window,&logfile,&format!("Server at {} sent an unknown status code {}. Are these versions compatible?",
+							            windowlog(&window,&logfile,&format!("-!- Server at {} sent an unknown status code {}. Are these versions compatible?",
 							                                                                                                serverhost,other));
 							            sleep(Duration::new(5,0));
 							        },
-							    }, // decrypt Ok
-							    Err(why) => match why.kind() {
-							        io::ErrorKind::InvalidData => {
-							            windowlog(&window,&logfile,&format!("Response from server did not validate. Local pad file is incorrect or invalid."));
-							        }
-							        _ => {
-							            windowlog(&window,&logfile,&format!("Failed to decrypt response from server - {}",why.description()));
-							            sleep(Duration::new(5,0));
-							        },
-							    }, // match why.kind
-                            }; // match inbin[0]
-                        } else { // if nrecv == 1
-							windowlog(&window,&logfile,&format!("Got invalid message of length {} from {}.",nrecv,srcaddr));
+							    };
+							} else {
+								windowlog(&window,&logfile,&format!("-!- Response from server did not validate. Local pad file is incorrect or invalid."));
+							}
+                        } else {
+							windowlog(&window,&logfile,&format!("-!- Got invalid message of length {} from {}.",nrecv,srcaddr));
 							sleep(Duration::new(5,0));
                         }
 					}, // recv Ok
@@ -558,7 +552,7 @@ fn main() {
 						io::ErrorKind::WouldBlock => break 'receiver,
 						_ => {
 							// Receive error
-							windowlog(&window,&logfile,&format!("Could not receive packet: {}. Trying again in 5 seconds...",why.description()));
+							windowlog(&window,&logfile,&format!("-!- Could not receive packet: {}. Trying again in 5 seconds...",why.description()));
 							sleep(Duration::new(5,0));
 						},
 					},
@@ -583,93 +577,88 @@ fn main() {
 								}
 							}
 							let payload:Vec<u8> = inbin[0..nrecv].to_vec();
-							match decrypt(&payload,&padpath) {
-								Err(why) => match why.kind() {
-									io::ErrorKind::InvalidData => {
-										// Validation failed
-										windowlog(&window,&logfile,"Warning: Message failed to validate. Pad file may be incorrect.");
-										let _ = sendbytes(&listener,&srcaddr,&vec![0x15],&padpath);
-										sleep(Duration::new(2,0));
-										break 'operator;
-									},
-									_ => {
-										// Other decryption error.
-										windowlog(&window,&logfile,&format!("Decrypting of message failed - {}.",why.description()));
-										let _ = sendbytes(&listener,&srcaddr,&vec![0x1A],&padpath);
-									},
-								},
-								Ok(message) => {
-									// If a message is successfully received and decrypted, display
-									// it. Also indicate if the message timestamp was invalid
-									// (either too far in the future or too far in the past), but
-									// since this is a human-facing client, we just want to flag
-									// these messages, not hide them completely.
-									let messagechars:Vec<u8> = message[0..message.len()-8].to_vec();
-									let mut messagetext:String = String::from_utf8_lossy(&messagechars).to_string();
-									let mut timestamp:[u8;8] = [0;8];
-									timestamp.copy_from_slice(&message[message.len()-8..message.len()]);
-									let msgtime:i64 = bytes_i64(&timestamp);
-									let mut msgstatus:String = String::new();
-									if msgtime + MSG_VALID_TIME < Local::now().timestamp_millis() {
-										msgstatus = format!(" [OUTDATED]");
-									} else if msgtime - MSG_VALID_TIME > Local::now().timestamp_millis() {
-										msgstatus = format!(" [FUTURE]");
-						            }
-						            if nrecv == 25 && &msgstatus == "" {
-							            // payloads of one byte are messages from the server.
-							            if window.get_cur_y() > 0 {
-								            // Display response codes from the server on the right-hand side of
-								            // the terminal, on the same line as the outgoing message the
-								            // response corresponds to.
-								            // This is a special case, NOT something that should be
-								            // replaced with a simple call to windowlog().
-								            window.mv(window.get_cur_y()-1,window.get_max_x()-4);
-								            window.clrtoeol();
-								            window.addstr(format!("0x{}",&bytes2hex(&vec![message[0]])));
-								            window.mv(window.get_cur_y()+1,0);
-								            window.clrtoeol();
-								            window.addstr(&PROMPT);
-								            window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
-								            window.refresh();
-							            }
-							            if message[0] == 0x19 { // END OF MEDIUM
-								            // Handle deauthentications
-								            windowlog(&window,&logfile,&format!("Subscription expiration notification received - renewing subscription to {}",
-																																		serverhost));
-								            continue 'recovery;
-							            }
-							            if message[0] == 0x02 {
-							            	// Handle requests for identification
-								            windowlog(&window,&logfile,&format!("Subscribed to server at {}.",serverhost));
-											let mut namemsg:Vec<u8> = vec![0x01];
-											let mut classmsg:Vec<u8> = vec![0x11];
-											namemsg.append(&mut clientname.as_bytes().to_vec());
-											classmsg.append(&mut clientclass.as_bytes().to_vec());
-											let _ = sendbytes(&listener,&serverhost,&namemsg,&padpath);
-											let _ = sendbytes(&listener,&serverhost,&classmsg,&padpath);
-											if ackbuffer.len() > 0 {
-												let _ = sendbytes(&listener,&srcaddr,&ackbuffer[0],&padpath);
-											}
-							            }
-							            if message[0] == 0x06 {
-							            	if ackbuffer.len() > 0 {
-												ackbuffer.remove(0);
-							            	}
-							            }
-						            } else {
-									    if arguments.is_present("showhex") {
-									        windowlog(&window,&logfile,&format!("[REM]{}: {} [{}]",msgstatus,messagetext,bytes2hex(&messagechars)));
-									    } else {
-									        windowlog(&window,&logfile,&format!("[REM]{}: {}",msgstatus,messagetext));
-									    }
-									    let _ = sendbytes(&listener,&srcaddr,&vec![0x06],&padpath);
+							let (datavalid,message):(bool,Vec<u8>) = decrypt(&payload,&pad);
+							// If a message is successfully received and decrypted, display
+							// it. Also indicate if the message timestamp was invalid
+							// (either too far in the future or too far in the past), but
+							// since this is a human-facing client, we just want to flag
+							// these messages, not hide them completely.
+							let messagebytes:Vec<u8> = message[0..message.len()-8].to_vec();
+							let mut messagetext:String = String::from_utf8_lossy(&messagebytes).to_string();
+							let messageparts:Vec<&str> = messagetext.splitn(2," ").collect::<Vec<&str>>();
+							let mut messagesender:&str = "<unspecified>";
+							let mut messagecontents:&str = "";
+							if messageparts.len() == 2 {
+								messagesender = messageparts[0];
+								messagecontents = messageparts[1];
+							} else if messageparts.len() == 1 {
+								messagecontents = messageparts[0];
+							}
+							let messagechars:Vec<u8> = messagecontents.as_bytes().to_vec();
+							let mut timestamp:[u8;8] = [0;8];
+							timestamp.copy_from_slice(&message[message.len()-8..message.len()]);
+							let msgtime:i64 = bytes_i64(&timestamp);
+							let mut msgstatus:String = String::new();
+							if !datavalid {
+								msgstatus = format!(" [INVALID SIGNATURE]");
+							} else if msgtime + MSG_VALID_TIME < Local::now().timestamp_millis() {
+								msgstatus = format!(" [OUTDATED]");
+							} else if msgtime - MSG_VALID_TIME > Local::now().timestamp_millis() {
+								msgstatus = format!(" [FUTURE]");
+						    }
+						    if nrecv == 25 && &msgstatus == "" {
+							    // payloads of one byte are messages from the server.
+							    if window.get_cur_y() > 0 {
+								    // Display response codes from the server on the right-hand side of
+								    // the terminal, on the same line as the outgoing message the
+								    // response corresponds to.
+								    // This is a special case, NOT something that should be
+								    // replaced with a simple call to windowlog().
+								    window.mv(window.get_cur_y()-1,window.get_max_x()-4);
+								    window.clrtoeol();
+								    window.addstr(format!("0x{}",&bytes2hex(&vec![message[0]])));
+								    window.mv(window.get_cur_y()+1,0);
+								    window.clrtoeol();
+								    window.addstr(&PROMPT);
+								    window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
+								    window.refresh();
+							    }
+							    if message[0] == 0x19 { // END OF MEDIUM
+								    // Handle deauthentications
+								    windowlog(&window,&logfile,&format!("- Subscription expiration notification received - renewing subscription to {}...",
+																																serverhost));
+								    continue 'recovery;
+							    }
+							    if message[0] == 0x02 {
+							        // Handle requests for identification
+								    windowlog(&window,&logfile,&format!("- Subscribed to server at {}.",serverhost));
+									let mut namemsg:Vec<u8> = vec![0x01];
+									let mut classmsg:Vec<u8> = vec![0x11];
+									namemsg.append(&mut clientname.as_bytes().to_vec());
+									classmsg.append(&mut clientclass.as_bytes().to_vec());
+									let _ = sendbytes(&listener,&serverhost,&namemsg,&pad);
+									let _ = sendbytes(&listener,&serverhost,&classmsg,&pad);
+									if ackbuffer.len() > 0 {
+										let _ = sendbytes(&listener,&srcaddr,&ackbuffer[0],&pad);
 									}
-								},
-							};
-						}
-					},
-				};
-			}
+							    }
+							    if message[0] == 0x06 {
+							        if ackbuffer.len() > 0 {
+										ackbuffer.remove(0);
+							        }
+							    }
+						    } else {
+								if arguments.is_present("showhex") {
+									windowlog(&window,&logfile,&format!("[{}]{}: {} [{}]",messagesender,msgstatus,messagecontents,bytes2hex(&messagechars)));
+								} else {
+									windowlog(&window,&logfile,&format!("[{}]{}: {}",messagesender,msgstatus,messagecontents));
+								}
+								let _ = sendbytes(&listener,&srcaddr,&vec![0x06],&pad);
+							}
+						} // if nrecv > 24
+					}, // recv ok
+				}; // match recvfrom
+			} // 'receiver
 			match window.getch() { 
 				// This is where we process keypress events. Most of these are going to be related
 				// to implementing basic line editing.
@@ -678,9 +667,9 @@ fn main() {
 						// This means "send the message", so we start by printing it to the screen
 						// above the input line.
 						if arguments.is_present("showhex") {
-						    windowlog(&window,&logfile,&format!("[LOC]: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
+						    windowlog(&window,&logfile,&format!("[local]: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
 						} else {
-						    windowlog(&window,&logfile,&format!("[LOC]: {}",String::from_utf8_lossy(&consoleline)));
+						    windowlog(&window,&logfile,&format!("[local]: {}",String::from_utf8_lossy(&consoleline)));
 						}
 						historypos = 0;
 						if linehistory.len() == 0 || linehistory[linehistory.len()-1] != consoleline {
@@ -689,9 +678,9 @@ fn main() {
 							linehistory.push(consoleline.clone());
 						}
 						// Send (and encrypt) the message.
-						match sendbytes(&listener,&serverhost,&consoleline,&padpath) {
+						match sendbytes(&listener,&serverhost,&consoleline,&pad) {
 							Err(why) => {
-								windowlog(&window,&logfile,&format!("Encrypting message failed - {}",why.description()));
+								windowlog(&window,&logfile,&format!("-!- Sending message failed - {}",why.description()));
 								continue 'operator;
 							},
 						    Ok(_) => (),
@@ -711,8 +700,8 @@ fn main() {
 							window.refresh();
 						}
 					},
-					0x1B => {
-						// ESCAPE
+					0x1B => { // ESCAPE
+						let _ = sendbytes(&listener,&serverhost,&vec![0x18],&pad);
 						endwin();
 						process::exit(0);
 					}
@@ -822,7 +811,7 @@ fn main() {
 				//Some(input) => {
 				//	window.addstr(&format!("{:?}",input));
 				//},
-				Some(x) => windowprint(&window,&format!("{:?}",x)),
+				Some(x) => windowprint(&window,&format!("-!- unknown keypress: {:?}",x)),
 				None => (),
 			};
 			window.refresh();

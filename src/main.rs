@@ -389,7 +389,8 @@ fn sendbytes(listener:&UdpSocket,destaddr:&SocketAddr,bytes:&Vec<u8>,padpath:&Pa
 
 fn main() {
 	let arguments = clap_app!(app =>
-		(version: "0.5")
+		(name: "Teamech Console")
+		(version: "0.5 2018-09")
 		(author: "Ellie D.")
 		(about: "Desktop console client for the Teamech protocol.")
 		(@arg ADDRESS: +required "Remote address to contact.")
@@ -481,6 +482,7 @@ fn main() {
 		let mut lastmsgs:Vec<Vec<u8>> = Vec::new(); // keeps track of messages that have already been received, to merge double-sends.
 		let mut consoleline:Vec<u8> = Vec::new(); // the bytestring holding the text currently typed into the console line editor
 		let mut linehistory:Vec<Vec<u8>> = Vec::new(); // the history of text entered at the console, for up-arrow message repeating
+		let mut ackbuffer:Vec<Vec<u8>> = Vec::new(); // Stores lines whose transmission has not been confirmed.
 		let mut historypos:usize = 0; // the scroll position of the history list, for up-arrow message repeating
 		let mut linepos:usize = 0; // the position of the cursor in the console line
 		'authtry:loop {
@@ -638,13 +640,21 @@ fn main() {
 							            }
 							            if message[0] == 0x02 {
 							            	// Handle requests for identification
-								            windowlog(&window,&logfile,&format!("Sending identification to {}",serverhost));
+								            windowlog(&window,&logfile,&format!("Subscribed to server at {}.",serverhost));
 											let mut namemsg:Vec<u8> = vec![0x01];
 											let mut classmsg:Vec<u8> = vec![0x11];
 											namemsg.append(&mut clientname.as_bytes().to_vec());
 											classmsg.append(&mut clientclass.as_bytes().to_vec());
 											let _ = sendbytes(&listener,&serverhost,&namemsg,&padpath);
 											let _ = sendbytes(&listener,&serverhost,&classmsg,&padpath);
+											if ackbuffer.len() > 0 {
+												let _ = sendbytes(&listener,&srcaddr,&ackbuffer[0],&padpath);
+											}
+							            }
+							            if message[0] == 0x06 {
+							            	if ackbuffer.len() > 0 {
+												ackbuffer.remove(0);
+							            	}
 							            }
 						            } else {
 									    if arguments.is_present("showhex") {
@@ -686,6 +696,7 @@ fn main() {
 							},
 						    Ok(_) => (),
 						};
+						ackbuffer.push(consoleline.clone());
 						consoleline = Vec::new();
 						linepos = 0;
 					},
@@ -720,6 +731,17 @@ fn main() {
 						window.refresh();
 					},
 				},
+				Some(Input::KeyBackspace) => {
+					// Maybe something's screwed up with ASCII del being sent, so we get this
+					// instead of the char 0x7F? Handle it the same way as a fallback.
+					if linepos > 0 {
+						let _ = consoleline.remove(linepos-1); 
+						window.mv(window.get_cur_y(),window.get_cur_x()-1);
+						window.delch();
+						linepos -= 1;
+						window.refresh();
+					}
+				}
 				Some(Input::KeyUp) => {
 					// The user is no doubt accustomed to being able to press the up and down arrow
 					// keys to scroll through previously-sent messages, so we implement that here
@@ -800,7 +822,7 @@ fn main() {
 				//Some(input) => {
 				//	window.addstr(&format!("{:?}",input));
 				//},
-				Some(_) => (),
+				Some(x) => windowprint(&window,&format!("{:?}",x)),
 				None => (),
 			};
 			window.refresh();

@@ -424,7 +424,7 @@ fn main() {
 		windowprint(&window,"");
 		let logfilename:String = format!("{}-teamech-desktop.log",Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
 		let logfile:&Path = Path::new(&logfilename);
-		windowprint(&window,&format!("Using log file {} in {}.",&logfilename,&LOG_DIRECTORY));
+		windowprint(&window,&format!("Using log file {} in ~/{}.",&logfilename,&LOG_DIRECTORY));
 		windowprint(&window,"");
 		match logtofile(&logfile,&format!("Opened log file."),Local::now()) {
 			Err(why) => {
@@ -496,7 +496,7 @@ fn main() {
 				Ok(_) => (),
 			};
 			for _ in 0..10 {
-				sleep(Duration::new(0,100_000_000));
+				sleep(Duration::new(0,500_000_000));
 				match listener.recv_from(&mut inbin) {
 					Err(why) => match why.kind() {
 						io::ErrorKind::WouldBlock => (),
@@ -540,7 +540,7 @@ fn main() {
 							sleep(Duration::new(5,0));
 						}
 					}, // recv Ok
-				}; // match recv
+				}; // match recvfrom
 			} // for 0..10
 		} // 'authtry
 		// Yay! If we made it down here, that means we're successfully authenticated and
@@ -652,6 +652,31 @@ fn main() {
 										window.refresh();
 									}
 								},
+								("",0x03,1) => (),
+								("",0x03,3) => {
+									if ackbuffer.len() > 0 {
+										ackbuffer.remove(0);
+									}
+									let mut nsends:u16 = 0;
+									nsends += message[2] as u16;
+									nsends += (message[1] as u16) << 8;
+									let nsendstr:&str = &format!("~[ {} ]",&nsends.to_string());
+									if window.get_cur_y() > 0 {
+										// Display response codes from the server on the right-hand side of
+										// the terminal, on the same line as the outgoing message the
+										// response corresponds to.
+										// This is a special case, NOT something that should be
+										// replaced with a simple call to windowlog().
+										window.mv(window.get_cur_y()-1,window.get_max_x()-(nsendstr.len() as i32));
+										window.clrtoeol();
+										window.addstr(format!("{}",&nsendstr));
+										window.mv(window.get_cur_y()+1,0);
+										window.clrtoeol();
+										window.addstr(&PROMPT);
+										window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
+										window.refresh();
+									}
+								},
 								("",0x05,_) => {
 									windowlog(&window,&logfile,&format!("- {}",&String::from_utf8_lossy(&message[1..message.len()-8])));
 								},
@@ -676,10 +701,12 @@ fn main() {
 					0x0A => { // ENTER
 						// This means "send the message", so we start by printing it to the screen
 						// above the input line.
-						if arguments.is_present("showhex") {
-							windowlog(&window,&logfile,&format!("<local>: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
-						} else {
-							windowlog(&window,&logfile,&format!("<local>: {}",String::from_utf8_lossy(&consoleline)));
+						if consoleline.len() > 0 {
+							if arguments.is_present("showhex") {
+								windowlog(&window,&logfile,&format!("<local>: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
+							} else {
+								windowlog(&window,&logfile,&format!("<local>: {}",String::from_utf8_lossy(&consoleline)));
+							}
 						}
 						historypos = 0;
 						if linehistory.len() == 0 || linehistory[linehistory.len()-1] != consoleline {

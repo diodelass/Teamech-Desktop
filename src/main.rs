@@ -1,4 +1,4 @@
-/* Teamech Desktop Client v0.6
+/* Teamech Desktop Client v0.6.1
  * September 2018
  * License: AGPL v3.0
  *
@@ -34,7 +34,7 @@
 Cargo.toml:
 [package]
 name = "teamech-console"
-version = "0.6.0"
+version = "0.6.1"
 authors = ["ellie"]
 
 [dependencies]
@@ -47,10 +47,11 @@ byteorder = "1"
 
  */
 
-static VERSION:&str = "0.6 September 2018";
+static VERSION:&str = "0.6.1 September 2018";
 static MSG_VALID_TIME:i64 = 10_000; // Tolerance interval in ms for packet timestamps outside of which to mark them as suspicious
 static LOG_DIRECTORY:&str = ".teamech-logs/desktop";
 static PROMPT:&str = "[teamech]: ";
+static BAR:char = '-';
 
 extern crate rand;
 
@@ -148,12 +149,27 @@ fn bytes2hex(v:&Vec<u8>) -> String {
 }
 
 // prints a line to the ncurses window - useful for condensing this common and lengthy invocation elsewhere.
-fn windowprint(window:&Window,line:&str) {
-	window.mv(window.get_cur_y(),0);
+fn windowprint(history:&mut Vec<(String,String)>,window:&Window,line:&str) {
+	history.push((line.to_owned(),String::new()));
+	let mut lines:Vec<String> = Vec::new();
+	let maxlen:usize = (window.get_max_x() as usize)-8;
+	let mut tmpline:String = line.to_owned();
+	while tmpline.len() > maxlen { 
+		lines.push(tmpline[0..maxlen].to_owned());
+		tmpline = tmpline[maxlen..tmpline.len()].to_owned();
+	}
+	lines.push(tmpline);
+	lines.reverse();
+	for newline in lines.iter() {
+		window.mv(window.get_max_y()-2,0);
+		window.clrtoeol();
+		window.addstr(&newline);
+		window.mv(0,0);
+		window.insdelln(-1);
+	}
+	window.mv(window.get_max_y()-2,0);
 	window.clrtoeol();
-	window.addstr(&line);
-	window.mv(0,0);
-	window.insdelln(-1);
+	window.hline::<u64>(BAR as u64,window.get_max_x());
 	window.mv(window.get_max_y()-1,0);
 	window.clrtoeol();
 	window.addstr(&PROMPT);
@@ -161,15 +177,63 @@ fn windowprint(window:&Window,line:&str) {
 }
 
 // prints a line to the ncurses window and also logs it.
-fn windowlog(window:&Window,logfile:&Path,line:&str) {
-	log(&window,&logfile,&line);
-	window.mv(window.get_cur_y(),0);
-	window.clrtoeol();
-	window.addstr(&format!("[{}] {}",Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),&line));
+fn windowlog(history:&mut Vec<(String,String)>,window:&Window,logfile:&Path,line:&str) {
+	log(history,&window,&logfile,&line);
+	windowprint(history,&window,&format!("[{}] {}",Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),&line));
+}
+
+fn windowpage(window:&Window,windowhistory:&Vec<(String,String)>,pagepos:&usize) {
+	if window.get_max_y() < 2 {
+		return;
+	}
+	let pagesize:usize = (window.get_max_y() as usize)-2;
+	let pagebottom:usize; 
+	if pagepos <= &windowhistory.len() {
+		pagebottom = windowhistory.len()-pagepos;
+	} else {
+		return;
+	}
+	let pagetop:usize;
+	if pagesize <= pagebottom {
+		pagetop = pagebottom-pagesize;
+	} else {
+		pagetop = 0;
+	}
+	window.clear();
+	let mut subhistorytmp:Vec<(String,String)> = windowhistory[pagetop..pagebottom].to_vec();
+	if subhistorytmp.len() < pagesize {
+		subhistorytmp.reverse();
+		while subhistorytmp.len() < pagesize {
+			subhistorytmp.push((String::new(),String::new()));
+		}
+		subhistorytmp.reverse();
+	}
+	let mut subhistory:Vec<(String,String)> = Vec::new();
+	let maxlinelen:usize = (window.get_max_x() as usize)-7;
+	while let Some(mut subline) = subhistorytmp.pop() {
+		let mut tempstack:Vec<(String,String)> = Vec::new();
+		while subline.0.len() > maxlinelen {
+			tempstack.push((subline.0[0..maxlinelen].to_owned(),String::new()));
+			subline.0 = subline.0[maxlinelen..subline.0.len()].to_owned();
+		}
+		tempstack.push(subline);
+		tempstack.reverse();
+		subhistory.append(&mut tempstack);
+	}
+	while subhistory.len() > (window.get_max_y() as usize)-2 {
+		let _ = subhistory.pop();
+	}
+	subhistory.reverse();
 	window.mv(0,0);
-	window.insdelln(-1);
+	for line in subhistory.iter() {
+		window.clrtoeol();
+		window.addstr(&line.0);
+		window.mv(window.get_cur_y(),window.get_max_x()-(line.1.len() as i32)-1);
+		window.addstr(&line.1);
+		window.mv(window.get_cur_y()+1,0);
+	}
+	window.hline::<u64>(BAR as u64,window.get_max_x());
 	window.mv(window.get_max_y()-1,0);
-	window.clrtoeol();
 	window.addstr(&PROMPT);
 	window.refresh();
 }
@@ -207,11 +271,11 @@ fn logtofile(logfilename:&Path,logstring:&str,timestamp:DateTime<Local>) -> Resu
 // Error-handling wrapper for logtofile() - rather than returning an error, prints the error
 // message to the console and returns nothing.
 // invocation template: log(&window,&
-fn log(window:&Window,logfilename:&Path,logstring:&str) {
+fn log(history:&mut Vec<(String,String)>,window:&Window,logfilename:&Path,logstring:&str) {
 	let timestamp:DateTime<Local> = Local::now();
 	match logtofile(&logfilename,&logstring,timestamp) {
 		Err(why) => {
-			windowprint(&window,&format!("ERROR: Failed to write to log file at {}: {}",logfilename.display(),why.description()));
+			windowprint(history,&window,&format!("ERROR: Failed to write to log file at {}: {}",logfilename.display(),why.description()));
 		},
 		Ok(()) => (),
 	};
@@ -411,6 +475,7 @@ fn main() {
 		// from the operator and smoothly restarts the program in the event of a problem.
 		// ncurses machinery (for the fancy console display stuff)
 		set_var("ESCDELAY","0"); // force ESCDELAY to be 0, so we can quit the application with the ESC key without the default 1-second delay.
+		let mut windowhistory:Vec<(String,String)> = Vec::new();
 		let window = initscr();
 		window.refresh(); // must be called every time the screen is to be updated.
 		window.keypad(true); // keypad mode, which is typical 
@@ -419,21 +484,22 @@ fn main() {
 		window.mv(window.get_max_y()-1,0); // go to the bottom left corner
 		window.refresh();
 		// Print welcome messages
-		windowprint(&window,&format!("Teamech Console {}",&VERSION));
-		windowprint(&window,"Press <Esc> to exit (or Ctrl-C to force exit).");
-		windowprint(&window,"");
+		windowprint(&mut windowhistory,&window,&format!("Teamech Console {}",&VERSION));
+		windowprint(&mut windowhistory,&window,"Press <Esc> to exit (or Ctrl-C to force exit).");
+		windowprint(&mut windowhistory,&window,"");
 		let logfilename:String = format!("{}-teamech-desktop.log",Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
 		let logfile:&Path = Path::new(&logfilename);
-		windowprint(&window,&format!("Using log file {} in ~/{}.",&logfilename,&LOG_DIRECTORY));
-		windowprint(&window,"");
+		windowprint(&mut windowhistory,&window,&format!("Using log file {} in ~/{}.",&logfilename,&LOG_DIRECTORY));
+		windowprint(&mut windowhistory,&window,"");
 		match logtofile(&logfile,&format!("Opened log file."),Local::now()) {
 			Err(why) => {
-				windowprint(&window,&format!("-!- WARNING: Could not open log file at {} - {}. Logs are currently NOT BEING SAVED - you should fix this!",
+				windowprint(&mut windowhistory,&window,&format!(
+				"-!- WARNING: Could not open log file at {} - {}. Logs are currently NOT BEING SAVED - you should fix this!",
 																												logfile.display(),why.description()));
 			},
 			Ok(_) => (),
 		};
-		windowlog(&window,&logfile,&format!("- Loading key data from pad file at {}...",&padpath.display()));
+		windowlog(&mut windowhistory,&window,&logfile,&format!("- Loading key data from pad file at {}...",&padpath.display()));
 		let mut pad:Vec<u8> = Vec::new();
 		match File::open(&padpath) {
 			Err(why) => {
@@ -448,7 +514,7 @@ fn main() {
 					process::exit(1);
 				},
 				Ok(_) => {
-					windowlog(&window,&logfile,"- Finished loading key data.");
+					windowlog(&mut windowhistory,&window,&logfile,"- Finished loading key data.");
 				},
 			},
 		};
@@ -484,12 +550,13 @@ fn main() {
 		let mut linehistory:Vec<Vec<u8>> = Vec::new(); // the history of text entered at the console, for up-arrow message repeating
 		let mut ackbuffer:Vec<Vec<u8>> = Vec::new(); // Stores lines whose transmission has not been confirmed.
 		let mut historypos:usize = 0; // the scroll position of the history list, for up-arrow message repeating
+		let mut pagepos:usize = 0;
 		let mut linepos:usize = 0; // the position of the cursor in the console line
 		'authtry:loop {
-			windowlog(&window,&logfile,&format!("- Trying to contact server..."));
+			windowlog(&mut windowhistory,&window,&logfile,&format!("- Trying to contact server..."));
 			match sendbytes(&listener,&serverhost,&vec![],&pad) {
 				Err(why) => {
-					windowlog(&window,&logfile,&format!("-!- Could not send authentication payload - {}.",why.description()));
+					windowlog(&mut windowhistory,&window,&logfile,&format!("-!- Could not send authentication payload - {}.",why.description()));
 					sleep(Duration::new(5,0));
 					continue 'authtry;
 				},
@@ -501,7 +568,7 @@ fn main() {
 					Err(why) => match why.kind() {
 						io::ErrorKind::WouldBlock => (),
 						_ => {
-							windowlog(&window,&logfile,&format!("-!- Could not receive authentication response - {}.",why.description()));
+							windowlog(&mut windowhistory,&window,&logfile,&format!("-!- Could not receive authentication response - {}.",why.description()));
 							sleep(Duration::new(5,0));
 							continue 'authtry;
 						},
@@ -512,7 +579,7 @@ fn main() {
 							if datavalid {
 								match message[0] {
 									0x02 => {
-										windowlog(&window,&logfile,&format!("- Subscribed to server at {}.",serverhost));
+										windowlog(&mut windowhistory,&window,&logfile,&format!("- Subscribed to server at {}.",serverhost));
 										let mut namemsg:Vec<u8> = vec![0x01];
 										let mut classmsg:Vec<u8> = vec![0x11];
 										namemsg.append(&mut clientname.as_bytes().to_vec());
@@ -522,21 +589,22 @@ fn main() {
 										break 'authtry;
 									},
 									0x19 => {
-										windowlog(&window,&logfile,
+										windowlog(&mut windowhistory,&window,&logfile,
 														&format!("-!- Pad file is correct, but subscription rejected by server. Server may be full."));
 										sleep(Duration::new(5,0));
 									},
 									other => {
-										windowlog(&window,&logfile,&format!("-!- Server at {} sent an unknown status code {}. Are these versions compatible?",
-																															serverhost,other));
+										windowlog(&mut windowhistory,&window,&logfile,
+											&format!("-!- Server at {} sent an unknown status code {}. Are these versions compatible?",serverhost,other));
 										sleep(Duration::new(5,0));
 									},
 								};
 							} else {
-								windowlog(&window,&logfile,&format!("-!- Response from server did not validate. Local pad file is incorrect or invalid."));
+								windowlog(&mut windowhistory,&window,&logfile,
+									&format!("-!- Response from server did not validate. Local pad file is incorrect or invalid."));
 							}
 						} else {
-							windowlog(&window,&logfile,&format!("-!- Got invalid message of length {} from {}.",nrecv,srcaddr));
+							windowlog(&mut windowhistory,&window,&logfile,&format!("-!- Got invalid message of length {} from {}.",nrecv,srcaddr));
 							sleep(Duration::new(5,0));
 						}
 					}, // recv Ok
@@ -553,7 +621,8 @@ fn main() {
 						io::ErrorKind::WouldBlock => break 'receiver,
 						_ => {
 							// Receive error
-							windowlog(&window,&logfile,&format!("-!- Could not receive packet: {}. Trying again in 5 seconds...",why.description()));
+							windowlog(&mut windowhistory,&window,&logfile,&format!("-!- Could not receive packet: {}. Trying again in 5 seconds...",
+								why.description()));
 							sleep(Duration::new(5,0));
 						},
 					},
@@ -610,13 +679,14 @@ fn main() {
 							match (msgstatus.as_ref(),message[0],messagebytes.len()) {
 								("",0x19,1) => { // END OF MEDIUM
 									// Handle deauthentications
-									windowlog(&window,&logfile,&format!("- Subscription expiration notification received - renewing subscription to {}...",
+									windowlog(&mut windowhistory,&window,&logfile,
+										&format!("- Subscription expiration notification received - renewing subscription to {}...",
 																																serverhost));
 									continue 'recovery;
 								},
 								("",0x02,1) => {
 									// Handle requests for identification
-									windowlog(&window,&logfile,&format!("- Subscribed to server at {}.",serverhost));
+									windowlog(&mut windowhistory,&window,&logfile,&format!("- Subscribed to server at {}.",serverhost));
 									let mut namemsg:Vec<u8> = vec![0x01];
 									let mut classmsg:Vec<u8> = vec![0x11];
 									namemsg.append(&mut clientname.as_bytes().to_vec());
@@ -636,16 +706,23 @@ fn main() {
 									nsends += message[2] as u16;
 									nsends += (message[1] as u16) << 8;
 									let nsendstr:&str = &format!("[ {} ]",&nsends.to_string());
+									if let Some(mut histent) = windowhistory.pop() {
+										histent.1 = nsendstr.to_owned();
+										windowhistory.push(histent);
+									}
 									if window.get_cur_y() > 0 {
 										// Display response codes from the server on the right-hand side of
 										// the terminal, on the same line as the outgoing message the
 										// response corresponds to.
 										// This is a special case, NOT something that should be
 										// replaced with a simple call to windowlog().
-										window.mv(window.get_cur_y()-1,window.get_max_x()-(nsendstr.len() as i32));
+										window.mv(window.get_max_y()-3,window.get_max_x()-(nsendstr.len() as i32)-1);
 										window.clrtoeol();
 										window.addstr(format!("{}",&nsendstr));
-										window.mv(window.get_cur_y()+1,0);
+										window.mv(window.get_max_y()-1,0);
+										window.clrtoeol();
+										//window.addch::<u64>(BAR as u64);
+										window.mv(window.get_max_y(),0);
 										window.clrtoeol();
 										window.addstr(&PROMPT);
 										window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
@@ -661,16 +738,23 @@ fn main() {
 									nsends += message[2] as u16;
 									nsends += (message[1] as u16) << 8;
 									let nsendstr:&str = &format!("~[ {} ]",&nsends.to_string());
+									if let Some(mut histent) = windowhistory.pop() {
+										histent.1 = nsendstr.to_owned();
+										windowhistory.push(histent);
+									}
 									if window.get_cur_y() > 0 {
 										// Display response codes from the server on the right-hand side of
 										// the terminal, on the same line as the outgoing message the
 										// response corresponds to.
 										// This is a special case, NOT something that should be
 										// replaced with a simple call to windowlog().
-										window.mv(window.get_cur_y()-1,window.get_max_x()-(nsendstr.len() as i32));
+										window.mv(window.get_max_y()-3,window.get_max_x()-(nsendstr.len() as i32)-1);
 										window.clrtoeol();
 										window.addstr(format!("{}",&nsendstr));
-										window.mv(window.get_cur_y()+1,0);
+										window.mv(window.get_max_y()-1,0);
+										window.clrtoeol();
+										//window.addch::<u64>(BAR as u64);
+										window.mv(window.get_max_y(),0);
 										window.clrtoeol();
 										window.addstr(&PROMPT);
 										window.addstr(&format!("{}",String::from_utf8_lossy(&consoleline)));
@@ -678,14 +762,14 @@ fn main() {
 									}
 								},
 								("",0x05,_) => {
-									windowlog(&window,&logfile,&format!("- {}",&String::from_utf8_lossy(&message[1..message.len()-8])));
+									windowlog(&mut windowhistory,&window,&logfile,&format!("- {}",&String::from_utf8_lossy(&message[1..message.len()-8])));
 								},
 								(status,_,n) => {
 									if arguments.is_present("showhex") {
-										windowlog(&window,&logfile,&format!("<{}>{}: {} [{}] [{}]",
+										windowlog(&mut windowhistory,&window,&logfile,&format!("<{}>{}: {} [{}] [{}]",
 												messagesender,status,messagecontents,bytes2hex(&messagechars),n));
 									} else {
-										windowlog(&window,&logfile,&format!("<{}>{}: {}",messagesender,status,messagecontents));
+										windowlog(&mut windowhistory,&window,&logfile,&format!("<{}>{}: {}",messagesender,status,messagecontents));
 									}
 									let _ = sendbytes(&listener,&srcaddr,&vec![0x06],&pad);
 								},
@@ -699,13 +783,18 @@ fn main() {
 				// to implementing basic line editing.
 				Some(Input::Character(c)) => match c as u8 {
 					0x0A => { // ENTER
+						if pagepos > 0 {
+							pagepos = 0;
+							windowpage(&window,&windowhistory,&pagepos);
+						}
 						// This means "send the message", so we start by printing it to the screen
 						// above the input line.
 						if consoleline.len() > 0 {
 							if arguments.is_present("showhex") {
-								windowlog(&window,&logfile,&format!("<local>: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
+								windowlog(&mut windowhistory,&window,&logfile,
+									&format!("<local>: {} [{}]",String::from_utf8_lossy(&consoleline),bytes2hex(&consoleline)));
 							} else {
-								windowlog(&window,&logfile,&format!("<local>: {}",String::from_utf8_lossy(&consoleline)));
+								windowlog(&mut windowhistory,&window,&logfile,&format!("<local>: {}",String::from_utf8_lossy(&consoleline)));
 							}
 						}
 						historypos = 0;
@@ -717,7 +806,7 @@ fn main() {
 						// Send (and encrypt) the message.
 						match sendbytes(&listener,&serverhost,&consoleline,&pad) {
 							Err(why) => {
-								windowlog(&window,&logfile,&format!("-!- Sending message failed - {}",why.description()));
+								windowlog(&mut windowhistory,&window,&logfile,&format!("-!- Sending message failed - {}",why.description()));
 								continue 'operator;
 							},
 							Ok(_) => (),
@@ -843,12 +932,25 @@ fn main() {
 					linepos = consoleline.len();
 					window.refresh();
 				},
-				// This stuff is just debugging.
-				//Some(Input::KeyResize) => (), 
-				//Some(input) => {
-				//	window.addstr(&format!("{:?}",input));
-				//},
-				Some(x) => windowprint(&window,&format!("-!- unknown keypress: {:?}",x)),
+				Some(Input::KeyResize) => {
+					windowpage(&window,&windowhistory,&pagepos);
+					window.addstr(&String::from_utf8_lossy(&consoleline));
+				}
+				Some(Input::KeyPPage) => {
+					if pagepos < windowhistory.len() {
+						pagepos += 1;
+						windowpage(&window,&windowhistory,&pagepos);
+						window.addstr(&String::from_utf8_lossy(&consoleline));
+					}
+				}
+				Some(Input::KeyNPage) => {
+					if pagepos > 0 {
+						pagepos -= 1;
+						windowpage(&window,&windowhistory,&pagepos);
+						window.addstr(&String::from_utf8_lossy(&consoleline));
+					}
+				}
+				Some(x) => windowprint(&mut windowhistory,&window,&format!("-!- unknown keypress: {:?}",x)),
 				None => (),
 			};
 			window.refresh();

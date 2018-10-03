@@ -1,6 +1,8 @@
 # Teamech
 ## A Simple Application Layer for the Intranet of Things
 
+## Notice: This repository is deprecated in favor of [Teamech 0.7](https://github.com/diodelass/teamech).
+
 ## Overview
 See also: main documentation on the 
 [Teamech server page](https://github.com/diodelass/Teamech-Server "Teamech Server").  
